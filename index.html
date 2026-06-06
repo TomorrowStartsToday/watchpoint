@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Watchpoint — Game Tracker (v2.3.0)</title>
+<title>Watchpoint — Game Tracker (v2.4.0)</title>
 <!-- v2.0.0-11: Inter + JetBrains Mono per the design system. preconnect speeds up the
      handshake; the actual stylesheet is loaded async with display=swap so first paint
      never blocks on Google's response. If Google Fonts is blocked or slow, the
@@ -2870,7 +2870,7 @@
       <span class="wp-account-pill" id="wp-account-pill" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false" aria-label="Switch account"></span>
       <div class="wp-account-menu" id="wp-account-menu" role="listbox"></div>
     </span>
-    <span class="wp-version">v2.3.0</span>
+    <span class="wp-version">v2.4.0</span>
   </div>
   <h2 class="sr-only">Watchpoint — Overwatch match tracker and analytics</h2>
 
@@ -3124,9 +3124,10 @@
   </div>
 
   <div id="trends-view" class="hidden">
-    <div style="display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 6px; margin-bottom: 1rem;" id="trends-tabs">
+    <div style="display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 6px; margin-bottom: 1rem;" id="trends-tabs">
       <button data-trends="day" class="trends-tab active">By day</button>
       <button data-trends="hour" class="trends-tab">By hour</button>
+      <button data-trends="teammates" class="trends-tab">Teammates</button>
       <button data-trends="best" class="trends-tab">Best per day</button>
       <button data-trends="streaks" class="trends-tab">Streaks</button>
     </div>
@@ -3298,7 +3299,15 @@
     'platformTrackingEnabled',
     'tunedWeights', 'tunedBrierScore', 'tunedNaiveBrier', 'tunedDefaultBrier',
     'tunedAtMatchCount', 'tunedModelVersion', 'tunedBlendAlpha', 'tunedLockedKeys',
-    'stateWeights', 'dynamicWeights'
+    'stateWeights', 'dynamicWeights',
+    // v2.4.0: Trends > Teammates persistent controls. Bucket = day/week/month/dow/hour;
+    // value mode = absolute/normalized. Per-account since data shapes differ.
+    'trendsTeammatesBucket', 'trendsTeammatesValue',
+    // v2.4.0: Synergy spotlight persistent controls. Same shape as the Trends
+    // counterparts but separate keys so users can prefer different views in
+    // each surface (e.g. weekly absolute for Trends, monthly normalized for
+    // a per-teammate role-drift spotlight).
+    'synergySpotlightBucket', 'synergySpotlightValue'
     // Note: backupNagSnoozedUntil stays global — snoozing the backup nag is a
     // device-level decision, not per-account. seasons stays global per spec.
     // theme, useQueueLayout, sleepyMode etc. live in account-scope because
@@ -3340,7 +3349,17 @@
       sickMode: false,
       periodMode: false,
       consoleMode: false,
-      platformTrackingEnabled: false
+      platformTrackingEnabled: false,
+      // v2.4.0: Trends > Teammates defaults. Week is the most data-friendly
+      // bucket for medium-range histories; absolute is the intuitive starting
+      // view (raw game counts before normalization to %).
+      trendsTeammatesBucket: 'week',
+      trendsTeammatesValue: 'absolute',
+      // v2.4.0: Synergy spotlight defaults. Same shape; separate state so a
+      // user can prefer (for example) weekly absolute in Trends but monthly
+      // normalized for the per-teammate spotlight.
+      synergySpotlightBucket: 'week',
+      synergySpotlightValue: 'absolute'
       // tunedWeights / stateWeights / dynamicWeights and related telemetry
       // populated by autoTuneWeights on first load — left undefined here
       // so freshly-created accounts run the auto-tune from scratch.
@@ -3621,6 +3640,16 @@
   let state = freshState();
   let currentRole = 'tank', currentMode = 'play', currentPickMode = 'manual';
   let currentStatsTab = 'overview', currentTrendsTab = 'day';
+  // v2.4.0: Overview trend card transient state. Per spec, neither persists
+  // across page loads — both reset to defaults on each load to keep the
+  // initial view tidy. Quick to swap once on the tab.
+  //   overviewCardMode: 'wr' | 'heroes' | 'roles' | 'queue'
+  //     WR shows the existing rolling-window sparkline; the others render the
+  //     stacked-area chart via the v2.4 shared infrastructure.
+  //   overviewCardRange: 100 | 200 | 500 | 'all'
+  //     How many most-recent matches feed the trend. Used by all modes.
+  let overviewCardMode = 'wr';
+  let overviewCardRange = 100;
   // Comp Builder state: ephemeral per-session. myRole determines which slot is "you",
   // slots is the 5-slot lineup in fixed role order, context controls how predictions weight time.
   let compBuilder = {
@@ -4185,6 +4214,507 @@
   function destroyCharts() {
     chartInstances.forEach(c => { try { c.destroy(); } catch(e){} });
     chartInstances = [];
+  }
+
+  // ============================================================================
+  // === STACKED-AREA INFRASTRUCTURE (v2.4.0) ===================================
+  // ============================================================================
+  // Shared renderer for the time-series visualizations introduced in v2.4.
+  // Powers three surfaces with a single pipeline:
+  //   1. Overview card  → self-tracking (heroes/roles/queue) at compact size
+  //   2. Trends Teammates → who I played with, full controls + Abs/Norm + 5 bucket modes
+  //   3. Synergy spotlight → role-drift for one teammate, same controls as Trends
+  // Pipeline: buildStackedAreaSeries(matches, opts) returns aggregated data;
+  // renderStackedArea(container, series, opts) draws via Chart.js. Decoupling
+  // lets callers compute once (e.g. for both legend rendering and the chart)
+  // and lets test code inspect the aggregated values without DOM.
+
+  // Color palettes. Three groups:
+  //   - STACKED_AREA_PALETTE: ranked categorical (cyan/amber/violet/pink/lime/
+  //       sky/rose/indigo). Used for top-N teammates and top-N heroes. Avoids
+  //       reserved hues (WR-tier reds/greens/yellows, role tank-blue/damage-red/
+  //       support-yellow). Picked for distinguishability at 12-band charts on
+  //       a dark surface; lightness ~60-70% across the palette so all bands
+  //       have similar visual weight.
+  //   - QUEUE_SIZE_PALETTE: sequential, lonely→social. Solo as muted slate,
+  //       then warming through amber/orange/pink to violet for 5-stack.
+  //       Visually orderable; brighter = more friends.
+  //   - ROLE_BAND_COLORS: concrete hex pulled from the --wp-tank/damage/
+  //       support tokens. Concrete (not var()) because Chart.js renders to a
+  //       2D canvas which can't resolve CSS variables; passing 'var(...)' as
+  //       a fillStyle parses as invalid and renders black. Used for the
+  //       Overview Roles mode + Synergy spotlight where bands are roles.
+  //       Light mode uses slightly darker variants of these hues, but at
+  //       chart-band saturation the dark-mode values read fine on either
+  //       theme, so one set covers both.
+  // SOLO_COLOR and OTHER_COLOR are reserved across all callers — Solo always
+  // muted-slate (recedes since it's "no teammate"), Other lighter slate.
+  var STACKED_AREA_PALETTE = [
+    '#06b6d4', // cyan
+    '#f59e0b', // amber
+    '#a78bfa', // violet
+    '#ec4899', // pink
+    '#84cc16', // lime
+    '#38bdf8', // sky
+    '#fb7185', // rose
+    '#818cf8'  // indigo
+  ];
+  var QUEUE_SIZE_PALETTE = {
+    solo:    '#64748b', // slate, "alone"
+    duo:     '#fbbf24', // amber
+    'three': '#fb923c', // orange
+    'four':  '#f472b6', // pink
+    'five':  '#c084fc'  // violet, "full party"
+  };
+  var ROLE_BAND_COLORS = {
+    tank: '#3b82f6',    // --wp-tank
+    damage: '#dc2626',  // --wp-damage
+    support: '#eab308'  // --wp-support
+  };
+  var SOLO_COLOR  = '#6b7280';
+  var OTHER_COLOR = '#9ca3af';
+
+  // Bucket-key helpers. Each takes a match, returns a string key + a display
+  // label. Stable string keys let the bucket aggregator use a plain object
+  // map; sorted by canonical order when rendering.
+  //
+  // For time-axis modes (day/week/month) the key encodes the date; the label
+  // is a human-friendly form. The label is used for x-axis tick labels in
+  // Chart.js. For cyclical modes (dow/hour) the key IS the canonical order
+  // (0–6 for dow, 0–23 for hour).
+  function stackedAreaBucketers() {
+    function pad(n) { return n < 10 ? '0' + n : '' + n; }
+    function isoDateKey(d) { return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()); }
+    function isoWeek(d) {
+      // ISO week: Thursday-anchored. Algorithm from the ISO 8601 spec.
+      var date = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+      var dayNum = date.getUTCDay() || 7;
+      date.setUTCDate(date.getUTCDate() + 4 - dayNum);
+      var yearStart = new Date(Date.UTC(date.getUTCFullYear(), 0, 1));
+      var weekNum = Math.ceil((((date - yearStart) / 86400000) + 1) / 7);
+      return { year: date.getUTCFullYear(), week: weekNum };
+    }
+    var DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    return {
+      day: function(m) {
+        var d = new Date(m.ts);
+        return { key: isoDateKey(d), label: d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }), sortBy: d.getTime() };
+      },
+      week: function(m) {
+        var d = new Date(m.ts);
+        var iw = isoWeek(d);
+        // Compute Monday of the ISO week for label + sort key
+        var jan4 = new Date(Date.UTC(iw.year, 0, 4));
+        var jan4Day = jan4.getUTCDay() || 7;
+        var weekStart = new Date(jan4);
+        weekStart.setUTCDate(jan4.getUTCDate() - jan4Day + 1 + (iw.week - 1) * 7);
+        return {
+          key: iw.year + '-W' + pad(iw.week),
+          label: weekStart.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }),
+          sortBy: weekStart.getTime()
+        };
+      },
+      month: function(m) {
+        var d = new Date(m.ts);
+        return {
+          key: d.getFullYear() + '-' + pad(d.getMonth() + 1),
+          label: d.toLocaleDateString(undefined, { month: 'short', year: '2-digit' }),
+          sortBy: new Date(d.getFullYear(), d.getMonth(), 1).getTime()
+        };
+      },
+      // Cyclical bucketers are paired with cyclicalDomain() at the call site
+      // — the caller passes a domain array to buildStackedAreaSeries so all
+      // expected slots seed with zero-data buckets. Without it, "5am"
+      // disappears from the hour view when the user never plays at 5am, and
+      // "Thursday" would compress to nothing if it's a low-play day. The
+      // full cycle reads more honestly with visible zero slots.
+      dow: function(m) {
+        var dow = matchDay(m);
+        return { key: 'dow-' + dow, label: DOW_LABELS[dow], sortBy: dow };
+      },
+      hour: function(m) {
+        var h = matchHour(m);
+        var label = h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p';
+        return { key: 'hour-' + pad(h), label: label, sortBy: h };
+      }
+    };
+  }
+
+  // Domain helper for cyclical bucketers — returns the full set of expected
+  // buckets in canonical order. Used by buildStackedAreaSeries when the
+  // caller picks a cyclical mode, so zero-slots fill in. Linear bucketers
+  // don't have a fixed domain (it depends on the data), and gap-filling
+  // them would inject misleading "I haven't played in 3 months" entries
+  // that aren't actionable, so we don't.
+  function cyclicalDomain(bucketMode) {
+    var DOW_LABELS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+    function pad(n) { return n < 10 ? '0' + n : '' + n; }
+    if (bucketMode === 'dow') {
+      return DOW_LABELS.map(function(label, i) { return { key: 'dow-' + i, label: label, sortBy: i }; });
+    }
+    if (bucketMode === 'hour') {
+      var hours = [];
+      for (var h = 0; h < 24; h++) {
+        var label = h === 0 ? '12a' : h < 12 ? h + 'a' : h === 12 ? '12p' : (h - 12) + 'p';
+        hours.push({ key: 'hour-' + pad(h), label: label, sortBy: h });
+      }
+      return hours;
+    }
+    return null;
+  }
+
+  // Band extractors. Each takes a match, returns an array of band keys —
+  // multiple bands per match are allowed (e.g. a 4-teammate match credits 4
+  // bands by 1 each). Single-band cases (role, queue-size) return a 1-element
+  // array. Hero swaps return an array of all heroes played in the match.
+  //
+  // These are the contract callers use to plug in different "what counts as
+  // a band" semantics. Stable string keys allow downstream coloring to look
+  // up via the same key.
+  function bandExtractors() {
+    return {
+      teammate: function(m) {
+        if (!m.teammates) return ['__solo'];
+        var names = Object.keys(m.teammates);
+        return names.length > 0 ? names : ['__solo'];
+      },
+      hero: function(m) {
+        return matchHeroes(m);
+      },
+      role: function(m) {
+        return [m.myRole];
+      },
+      queueSize: function(m) {
+        var n = m.teammates ? Object.keys(m.teammates).length : 0;
+        if (n === 0) return ['solo'];
+        if (n === 1) return ['duo'];
+        if (n === 2) return ['three'];
+        if (n === 3) return ['four'];
+        return ['five']; // n >= 4 (full premade)
+      },
+      // roleOfTeammate: closure factory — returns an extractor that yields
+      // the role played by a specific teammate in the match. Used by the
+      // Synergy spotlight card to chart how one person's role mix has
+      // drifted over time. Matches where the teammate wasn't present
+      // yield an empty array (the match doesn't contribute to any band).
+      roleOfTeammate: function(name) {
+        return function(m) {
+          if (!m.teammates || !m.teammates[name]) return [];
+          return [m.teammates[name]];
+        };
+      }
+    };
+  }
+
+  // Color resolver. Maps a band key to a color, considering reserved bands
+  // (Solo/Other use fixed grays; roles use --wp-* tokens; queue-size uses
+  // the sequential palette) before falling back to the ranked palette.
+  //
+  // `rankIndex` is the band's position in the top-N ranking (0-based), used
+  // to pick from STACKED_AREA_PALETTE. For palettes with fixed bands (role,
+  // queueSize) the rank is ignored — the color is determined by the band key.
+  function resolveBandColor(bandKey, rankIndex, palette) {
+    if (bandKey === '__solo' || bandKey === 'solo') return palette === 'queue' ? QUEUE_SIZE_PALETTE.solo : SOLO_COLOR;
+    if (bandKey === '__other') return OTHER_COLOR;
+    if (palette === 'role') return ROLE_BAND_COLORS[bandKey] || OTHER_COLOR;
+    if (palette === 'queue') return QUEUE_SIZE_PALETTE[bandKey] || OTHER_COLOR;
+    // Default: ranked categorical (teammates, heroes)
+    return STACKED_AREA_PALETTE[rankIndex % STACKED_AREA_PALETTE.length];
+  }
+
+  // Label resolver — for reserved bands, override the raw key with a
+  // human-friendly label. Useful for queueSize ('solo' → 'Solo', 'duo' →
+  // 'Duo', etc.) and for the synthetic Solo/Other groupings on teammate
+  // mode.
+  function resolveBandLabel(bandKey, palette) {
+    if (bandKey === '__solo') return 'Solo';
+    if (bandKey === '__other') return 'Other';
+    if (palette === 'queue') {
+      return { solo: 'Solo', duo: 'Duo', three: '3-stack', four: '4-stack', five: '5-stack' }[bandKey] || bandKey;
+    }
+    if (palette === 'role') {
+      return bandKey.charAt(0).toUpperCase() + bandKey.slice(1);
+    }
+    return bandKey;
+  }
+
+  // buildStackedAreaSeries — the core aggregation pipeline.
+  //
+  //   matches: filtered match array (caller has already applied global filters)
+  //   opts:
+  //     bucketer: function from stackedAreaBucketers(), e.g. 'week'
+  //     extractor: function from bandExtractors(), e.g. 'hero'
+  //     topN: number of distinct bands to show; rest aggregate into 'Other'
+  //     palette: 'categorical' (default) | 'role' | 'queue' — determines
+  //         color assignment (resolveBandColor) and canonical legend order.
+  //         'role' and 'queue' use fixed-domain colors keyed by band name;
+  //         categorical assigns colors by rank position.
+  //     soloLabel: bool — whether the extractor's __solo synthetic band should
+  //         keep its own band (true for teammate mode) or merge into Other
+  //         (false for hero/role/queueSize where solo isn't meaningful)
+  //     includeOther: bool — whether to emit the aggregated Other band
+  //     domain: array of { key, label, sortBy } — when present, seeds the
+  //         bucket map with zero-data slots so empty buckets persist through
+  //         aggregation. Used by cyclical modes (dow/hour) via
+  //         cyclicalDomain() to ensure all 7 days / 24 hours render even
+  //         when the user has zero matches in some slots.
+  //
+  // Returns:
+  //   {
+  //     buckets: [{ key, label, sortBy, total }, ...],  // canonical bucket order
+  //     bands:   [{ key, label, color, total, data: [n,n,...] }, ...],
+  //     totals:  { ranked: N, other: M, solo: K }
+  //   }
+  function buildStackedAreaSeries(matches, opts) {
+    var bucketer = opts.bucketer;
+    var extractor = opts.extractor;
+    var topN = opts.topN || 6;
+    var palette = opts.palette || 'categorical';
+    var soloLabel = !!opts.soloLabel;
+    var includeOther = opts.includeOther !== false;
+    var domain = opts.domain || null; // v2.4.0: cyclical pre-fill
+
+    // 1. Walk matches, aggregating per-bucket per-band counts.
+    var bucketMap = {}; // key -> { key, label, sortBy, plays: { bandKey: count } }
+    // Seed cyclical domain so empty slots persist through aggregation.
+    if (domain) {
+      domain.forEach(function(d) {
+        bucketMap[d.key] = { key: d.key, label: d.label, sortBy: d.sortBy, plays: {} };
+      });
+    }
+    var bandTotals = {}; // bandKey -> total plays across all buckets
+    matches.forEach(function(m) {
+      var b = bucketer(m);
+      if (!bucketMap[b.key]) bucketMap[b.key] = { key: b.key, label: b.label, sortBy: b.sortBy, plays: {} };
+      var bk = bucketMap[b.key];
+      var bands = extractor(m) || [];
+      bands.forEach(function(bandKey) {
+        bk.plays[bandKey] = (bk.plays[bandKey] || 0) + 1;
+        bandTotals[bandKey] = (bandTotals[bandKey] || 0) + 1;
+      });
+    });
+
+    // 2. Rank bands by total plays. The synthetic __solo band is pulled out
+    //    if soloLabel is true so it gets its own dedicated band — otherwise
+    //    it competes for top-N slots like any other band.
+    var soloTotal = 0;
+    if (soloLabel && bandTotals['__solo']) {
+      soloTotal = bandTotals['__solo'];
+      delete bandTotals['__solo'];
+    }
+    var ranked = Object.keys(bandTotals).map(function(k) {
+      return { key: k, total: bandTotals[k] };
+    }).sort(function(a, b) { return b.total - a.total; });
+
+    var topBands = ranked.slice(0, topN);
+    var otherBands = ranked.slice(topN);
+    var otherTotal = otherBands.reduce(function(s, b) { return s + b.total; }, 0);
+    var otherKeys = {};
+    otherBands.forEach(function(b) { otherKeys[b.key] = true; });
+
+    // 3. Sort buckets by canonical order (sortBy).
+    var sortedBuckets = Object.values(bucketMap).sort(function(a, b) { return a.sortBy - b.sortBy; });
+
+    // 4. Build the final band datasets. Order: top-N (rank 0..N-1) +
+    //    Other (if any) + Solo (if any and soloLabel).
+    var bands = topBands.map(function(b, i) {
+      return {
+        key: b.key,
+        label: resolveBandLabel(b.key, palette),
+        color: resolveBandColor(b.key, i, palette),
+        total: b.total,
+        data: sortedBuckets.map(function(bk) { return bk.plays[b.key] || 0; })
+      };
+    });
+
+    if (includeOther && otherTotal > 0) {
+      bands.push({
+        key: '__other',
+        label: 'Other',
+        color: OTHER_COLOR,
+        total: otherTotal,
+        data: sortedBuckets.map(function(bk) {
+          var sum = 0;
+          Object.keys(bk.plays).forEach(function(k) { if (otherKeys[k]) sum += bk.plays[k]; });
+          return sum;
+        })
+      });
+    }
+
+    if (soloLabel && soloTotal > 0) {
+      bands.push({
+        key: '__solo',
+        label: 'Solo',
+        color: SOLO_COLOR,
+        total: soloTotal,
+        data: sortedBuckets.map(function(bk) { return bk.plays['__solo'] || 0; })
+      });
+    }
+
+    // v2.4.0: re-sort bands by canonical order for fixed-domain palettes.
+    // Rank-by-plays is right for categorical (teammates, heroes) but wrong
+    // for ordered domains where the legend should read logically (Solo → 5-
+    // stack for queue, Tank → Damage → Support for roles). Other and __solo
+    // synthetic bands always go last regardless.
+    var canonicalOrder = null;
+    if (palette === 'queue') {
+      canonicalOrder = { solo: 0, duo: 1, three: 2, four: 3, five: 4 };
+    } else if (palette === 'role') {
+      canonicalOrder = { tank: 0, damage: 1, support: 2 };
+    }
+    if (canonicalOrder) {
+      bands.sort(function(a, b) {
+        // Synthetic bands (__other, __solo) always sort to the end.
+        var aSynth = a.key === '__other' || a.key === '__solo';
+        var bSynth = b.key === '__other' || b.key === '__solo';
+        if (aSynth && !bSynth) return 1;
+        if (!aSynth && bSynth) return -1;
+        if (aSynth && bSynth) return 0;
+        var aOrder = canonicalOrder[a.key];
+        var bOrder = canonicalOrder[b.key];
+        // Unknown keys (shouldn't happen at fixed-domain palettes) sort to end
+        if (aOrder === undefined) return 1;
+        if (bOrder === undefined) return -1;
+        return aOrder - bOrder;
+      });
+    }
+
+    // Compute per-bucket totals (used for normalized rendering + tooltips).
+    var bucketTotals = sortedBuckets.map(function(bk) {
+      return Object.keys(bk.plays).reduce(function(s, k) { return s + bk.plays[k]; }, 0);
+    });
+    sortedBuckets.forEach(function(bk, i) { bk.total = bucketTotals[i]; });
+
+    return {
+      buckets: sortedBuckets,
+      bands: bands,
+      totals: { ranked: ranked.reduce(function(s, b) { return s + b.total; }, 0), other: otherTotal, solo: soloTotal }
+    };
+  }
+
+  // renderStackedArea — drops a Chart.js stacked-area chart into the given
+  // canvas element. Series is the output of buildStackedAreaSeries.
+  //
+  //   opts:
+  //     mode: 'absolute' | 'normalized'
+  //     legend: bool (default true)
+  //
+  // Caller is responsible for sizing — wrap the canvas in a parent element
+  // with explicit CSS height; Chart.js fills it via maintainAspectRatio:false.
+  //
+  // Returns the Chart instance so the caller can attach it to chartInstances
+  // for destruction on re-render. If series.buckets is empty, draws nothing
+  // and returns null — caller should show an empty-state instead.
+  function renderStackedArea(canvasEl, series, opts) {
+    if (!canvasEl || !series || series.buckets.length === 0) return null;
+    var mode = opts && opts.mode === 'normalized' ? 'normalized' : 'absolute';
+    var showLegend = !opts || opts.legend !== false;
+
+    // For normalized mode, pre-compute each bucket's percentages. Chart.js's
+    // built-in `stacked: true` only does additive stacking — we transform
+    // the data ourselves so the y-axis can stay 0–100 and tooltips show %.
+    var datasets = series.bands.map(function(band) {
+      var data = band.data;
+      if (mode === 'normalized') {
+        data = band.data.map(function(v, i) {
+          var total = series.buckets[i].total;
+          return total > 0 ? (v / total) * 100 : 0;
+        });
+      }
+      return {
+        label: band.label,
+        data: data,
+        backgroundColor: band.color,
+        borderColor: band.color,
+        borderWidth: 0,
+        fill: true,
+        tension: 0.25,
+        pointRadius: 0,
+        pointHoverRadius: 3,
+        stack: 'main'
+      };
+    });
+
+    var ctx = canvasEl.getContext('2d');
+    var chart = new Chart(ctx, {
+      type: 'line',
+      data: {
+        labels: series.buckets.map(function(bk) { return bk.label; }),
+        datasets: datasets
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        animation: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: {
+            stacked: true,
+            ticks: {
+              color: 'rgba(148, 163, 184, 0.7)',
+              font: { size: 10 },
+              maxRotation: 0,
+              autoSkip: true,
+              autoSkipPadding: 8
+            },
+            grid: { display: false }
+          },
+          y: {
+            stacked: true,
+            beginAtZero: true,
+            max: mode === 'normalized' ? 100 : undefined,
+            ticks: {
+              color: 'rgba(148, 163, 184, 0.7)',
+              font: { size: 10 },
+              callback: mode === 'normalized'
+                ? function(v) { return v + '%'; }
+                : undefined
+            },
+            grid: { color: 'rgba(148, 163, 184, 0.08)' }
+          }
+        },
+        plugins: {
+          legend: {
+            display: showLegend,
+            position: 'bottom',
+            labels: {
+              color: 'rgba(226, 232, 240, 0.85)',
+              font: { size: 11 },
+              boxWidth: 12,
+              padding: 8
+            }
+          },
+          tooltip: {
+            callbacks: {
+              label: function(ctx) {
+                var v = ctx.parsed.y;
+                if (mode === 'normalized') return ctx.dataset.label + ': ' + v.toFixed(1) + '%';
+                return ctx.dataset.label + ': ' + v + 'g';
+              }
+            }
+          }
+        }
+      }
+    });
+    chartInstances.push(chart);
+    return chart;
+  }
+
+  // Auto-pick a time bucket mode based on the calendar span of the selected
+  // match range. Used by the Overview card (which doesn't expose bucket
+  // controls); Trends/Synergy let the user pick directly. Span is computed
+  // in days from the earliest to the latest match in `matches`.
+  function autoBucketMode(matches) {
+    if (matches.length < 2) return 'day';
+    var minTs = Infinity, maxTs = -Infinity;
+    matches.forEach(function(m) {
+      if (m.ts < minTs) minTs = m.ts;
+      if (m.ts > maxTs) maxTs = m.ts;
+    });
+    var spanDays = (maxTs - minTs) / (24 * 60 * 60 * 1000);
+    if (spanDays <= 30) return 'day';
+    if (spanDays <= 180) return 'week';
+    return 'month';
   }
 
   function getStats(hero) { return state.stats[hero] || { plays: 0, wins: 0, losses: 0 }; }
@@ -8305,10 +8835,145 @@
   // need to know the threshold). Self-contained — only depends on `all` and module-level
   // wrColor helper.
   function renderOverviewTrend(all) {
-    if (all.length < 30) return '';
-    var out = '';
+    // v2.4.0: card always renders. WR mode shows a "need 30 matches" empty
+    // state in its own body (renderOverviewWRSparkline); the composition
+    // modes (Heroes/Roles/Queue) render whatever data exists, even sparse.
+    // Previously this function early-returned an empty string below 30
+    // matches, hiding the whole card — including controls — so users on
+    // new accounts couldn't discover or use the non-WR modes. The empty
+    // state where no matches exist at all (a brand-new account) is handled
+    // upstream by renderStatsOverview which shows the global empty state.
+
+    // v2.4.0: card now supports four modes. WR keeps the original sparkline;
+    // Heroes/Roles/Queue are stacked-area charts on the most-recent N matches
+    // determined by the range dropdown. Mode + range are module-level so
+    // event handlers can update them without re-rendering the whole Stats
+    // tree; renderStats() re-runs renderOverviewTrend with the new values.
+
+    // Pull the selected match window. Linear modes (100/200/500/all) slice
+    // the most recent N from time-sorted matches. Cyclical modes (dow/hour)
+    // use the full match log — the bucket key collapses time into the cycle.
     var sorted = all.slice().sort(function(a, b) { return a.ts - b.ts; });
-    var windowSize = Math.min(100, Math.floor(sorted.length / 2));
+    var rangeWindow;
+    var isCyclical = (overviewCardRange === 'dow' || overviewCardRange === 'hour');
+    if (isCyclical || overviewCardRange === 'all') {
+      rangeWindow = sorted;
+    } else {
+      rangeWindow = sorted.slice(Math.max(0, sorted.length - overviewCardRange));
+    }
+
+    // Range dropdown + mode segmented control. Inline buttons reuse the
+    // existing .stats-tab styling (per user direction) for the mode swap;
+    // the range dropdown is a regular .filter-select. Active mode gets
+    // .active via data-overview-mode= attr matching.
+    var rangeOptions = [
+      { v: 100, label: 'Last 100' },
+      { v: 200, label: 'Last 200' },
+      { v: 500, label: 'Last 500' },
+      { v: 'all', label: 'All time (' + sorted.length + ')' },
+      // v2.4.0: cyclical aggregation axes. These use all matches but bucket
+      // by day-of-week or hour-of-day instead of linear time. Surfaces
+      // patterns like "Mondays I play support" or "At 10pm I play more
+      // damage." Only meaningful for the composition modes — WR mode in a
+      // cyclical view falls back to the linear sparkline (showing rolling
+      // WR by Monday/Tuesday/etc. isn't a "trend").
+      { v: 'dow', label: 'By day of week' },
+      { v: 'hour', label: 'By time of day' }
+    ];
+    var rangeSelHtml = '<select class="filter-select" id="overview-card-range" style="font-size: 12px; padding: 3px 6px;">';
+    rangeOptions.forEach(function(o) {
+      // Only numeric ranges check the length cap; cyclical values are always selectable.
+      var disabled = (typeof o.v === 'number' && o.v > sorted.length) ? ' disabled' : '';
+      rangeSelHtml += '<option value="' + o.v + '"' + (overviewCardRange == o.v ? ' selected' : '') + disabled + '>' + o.label + '</option>';
+    });
+    rangeSelHtml += '</select>';
+
+    var modes = [
+      { v: 'wr', label: 'WR' },
+      { v: 'heroes', label: 'Heroes' },
+      { v: 'roles', label: 'Roles' },
+      { v: 'queue', label: 'Queue' }
+    ];
+    var modeBtnHtml = '<div style="display: inline-flex; gap: 2px;" id="overview-card-modes">';
+    modes.forEach(function(m) {
+      var active = m.v === overviewCardMode ? ' active' : '';
+      modeBtnHtml += '<button class="stats-tab' + active + '" data-overview-mode="' + m.v + '" style="font-size: 11px; padding: 4px 10px;">' + m.label + '</button>';
+    });
+    modeBtnHtml += '</div>';
+
+    // Header strip: range dropdown + mode segmented control.
+    var out = '<div class="trend-card" style="flex-direction: column; align-items: stretch; gap: 8px;">';
+    out += '<div style="display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap;">' +
+      '<div style="display: flex; align-items: center; gap: 8px;">' + rangeSelHtml + modeBtnHtml + '</div>' +
+    '</div>';
+
+    if (overviewCardMode === 'wr') {
+      // WR mode — linear rolling sparkline. Cyclical range values don't apply
+      // here (you can't have a "trend over Mondays"), so fall through to the
+      // all-time sparkline with a note in the label.
+      if (isCyclical) {
+        out += '<div style="font-size: 11px; color: var(--wp-fg-3); margin-bottom: 4px;">WR trend uses linear time — switch to Heroes / Roles / Queue to see this view by ' + (overviewCardRange === 'dow' ? 'day of week' : 'time of day') + '.</div>';
+      }
+      out += renderOverviewWRSparkline(rangeWindow);
+    } else {
+      // Composition modes — stacked area into a canvas element. The actual
+      // Chart.js instantiation happens after innerHTML is set; see the
+      // "Overview trend card wiring" block in renderStats() which reads the
+      // data-* attrs and feeds them through buildStackedAreaSeries.
+      var extractor, palette, topN, soloLabel, includeOther;
+      if (overviewCardMode === 'heroes') {
+        extractor = 'hero'; palette = 'categorical'; topN = 4; soloLabel = false; includeOther = true;
+      } else if (overviewCardMode === 'roles') {
+        extractor = 'role'; palette = 'role'; topN = 3; soloLabel = false; includeOther = false;
+      } else { // queue
+        extractor = 'queueSize'; palette = 'queue'; topN = 5; soloLabel = false; includeOther = false;
+      }
+      // Stash params on the canvas element via data-* so the post-render
+      // hook can read them without globals.
+      var bucketChoice = isCyclical ? overviewCardRange : 'auto';
+      out += '<div style="height: 180px; position: relative;">' +
+        '<canvas id="overview-card-canvas" ' +
+          'data-extractor="' + extractor + '" ' +
+          'data-palette="' + palette + '" ' +
+          'data-topn="' + topN + '" ' +
+          'data-solo-label="' + (soloLabel ? '1' : '0') + '" ' +
+          'data-include-other="' + (includeOther ? '1' : '0') + '" ' +
+          'data-bucket="' + bucketChoice + '" ' +
+          '></canvas>' +
+      '</div>';
+    }
+
+    out += '</div>';
+    return out;
+  }
+
+  // Extracted from the original renderOverviewTrend: the rolling-window WR
+  // sparkline. Now a helper called from the WR-mode branch of the new mode-
+  // aware card. Window size scales with the selected range (see body for the
+  // exact formula); non-numeric range values ('all', 'dow', 'hour') all use
+  // the full input. The cyclical values arrive here via the linear-fallback
+  // path in renderOverviewTrend since cyclical WR isn't meaningful.
+  function renderOverviewWRSparkline(all) {
+    if (all.length < 30) {
+      return '<div class="empty-state" style="padding: 20px;">Need at least 30 matches in the range for a trend.</div>';
+    }
+    var sorted = all.slice().sort(function(a, b) { return a.ts - b.ts; });
+    // v2.4.0: window size scales with the selected range so the label reads
+    // accurately and the smoothing actually reflects the user's choice. Cap
+    // at half of the input (so we still produce >1 rolling point), and at
+    // 200 in the "all" / cyclical-fallback cases so very long histories
+    // don't get over-smoothed into a flat line.
+    //
+    // Non-numeric range values ('all', 'dow', 'hour') all share the
+    // "use the full input" path. 'dow'/'hour' reach this function via
+    // renderOverviewTrend's cyclical-fallback branch (the WR view doesn't
+    // really apply to cyclical bucketing, so we show the all-time linear
+    // sparkline with a note instead). Treating them like 'all' avoids
+    // string-as-number coercion to NaN, which previously broke the SVG.
+    var targetWindow = (typeof overviewCardRange === 'number')
+      ? overviewCardRange
+      : Math.min(200, sorted.length);
+    var windowSize = Math.min(targetWindow, Math.max(20, Math.floor(sorted.length / 2)));
     var rollingPts = [];
     for (var ri = windowSize - 1; ri < sorted.length; ri++) {
       var windowWins = 0;
@@ -8318,8 +8983,6 @@
       rollingPts.push(Math.round((windowWins / windowSize) * 100));
     }
 
-    // viewBox-based sparkline: scales fluidly to fill its flex container.
-    // 200×40 viewBox per spec; height clamped to 30px via CSS, width fluid.
     var sparkW = 200, sparkH = 40;
     var minWR = Math.min.apply(null, rollingPts);
     var maxWR = Math.max.apply(null, rollingPts);
@@ -8335,36 +8998,27 @@
     var trendDelta = lastWR - firstWR;
     var trendSign = trendDelta > 0 ? '+' : '';
 
-    // v2.0.0-13m: per spec, the trend delta number stays SATURATED (--wp-win
-    // / --wp-loss) for emphasis, but the sparkline polyline uses the FADED
-    // variant (--wp-win-faded / --wp-loss-faded) so it reads as supporting
-    // illustration. Neutral trend (within ±3) uses fg-2 for the number, faded
-    // gray for the line.
     var trendColor, lineColor;
     if (trendDelta > 3) {
-      trendColor = 'var(--wp-win)';
-      lineColor = '#86efac'; // light green per spec
+      trendColor = 'var(--wp-win)'; lineColor = '#86efac';
     } else if (trendDelta < -3) {
-      trendColor = 'var(--wp-loss)';
-      lineColor = '#fca5a5'; // light red per spec
+      trendColor = 'var(--wp-loss)'; lineColor = '#fca5a5';
     } else {
-      trendColor = 'var(--wp-fg-2)';
-      lineColor = 'var(--wp-fg-3)';
+      trendColor = 'var(--wp-fg-2)'; lineColor = 'var(--wp-fg-3)';
     }
 
-    // 50% reference line (only when the window crosses 50%)
     var y50 = sparkH - 2 - ((50 - minWR) / range) * (sparkH - 4);
     var show50 = minWR < 50 && maxWR > 50;
 
-    out += '<div class="trend-card">';
+    // Same 3-column inner layout as before (delta / sparkline / now), now
+    // wrapped in a flex row inside the parent column-flex card.
+    var out = '<div style="display: flex; align-items: center; gap: 16px;">';
     out += '<div class="trend-left"><div class="trend-label">Trend (' + windowSize + 'g avg)</div>';
     out += '<div class="trend-value" style="color: ' + trendColor + ';">' + trendSign + trendDelta + '%</div></div>';
-    out += '<div class="trend-sparkline"><svg viewBox="0 0 ' + sparkW + ' ' + sparkH + '" preserveAspectRatio="none">';
+    out += '<div class="trend-sparkline" style="flex: 1;"><svg viewBox="0 0 ' + sparkW + ' ' + sparkH + '" preserveAspectRatio="none">';
     if (show50) out += '<line x1="0" y1="' + y50.toFixed(1) + '" x2="' + sparkW + '" y2="' + y50.toFixed(1) + '" stroke="var(--wp-border)" stroke-width="1" stroke-dasharray="3,3"/>';
     out += '<polyline points="' + sparkPts.join(' ') + '" fill="none" stroke="' + lineColor + '" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>';
     out += '</svg></div>';
-    // "Now" stays WR-tinted via wrColor() — confirmed user preference over
-    // role/accent treatment from the spec demo.
     out += '<div class="trend-right"><div class="trend-label">Now</div>';
     out += '<div class="trend-value" style="color: ' + wrColor(lastWR) + ';">' + lastWR + '%</div></div>';
     out += '</div>';
@@ -9021,6 +9675,48 @@
             '<div class="stat-r">' + statHTML + '</div>' +
           '</div>';
         });
+        html += '</div>';
+
+        // v2.4.0: Synergy spotlight — role drift chart for this specific
+        // teammate. Bands are the roles they've played (Tank/Damage/Support)
+        // bucketed over time. Reuses the v2.4 stacked-area infrastructure
+        // via the roleOfTeammate extractor closure. Click handlers stop
+        // propagation so the expand-toggle on the parent card doesn't fire
+        // when the user changes bucket or value mode. Canvas is keyed by
+        // teammate name so Chart.js instantiation can find the right element.
+        var spotlightBucket = state.synergySpotlightBucket || 'week';
+        var spotlightValue = state.synergySpotlightValue || 'absolute';
+        html += '<div class="synergy-spotlight" data-spotlight-card="' + escapeHtml(p.name) + '" style="margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--wp-border);">';
+        html += '<div class="eyebrow" style="margin-bottom: 6px;">Role drift over time</div>';
+        // Bucket + value control strips. Compact since the card is already
+        // narrow. data-spotlight-* attrs let us scope click handlers without
+        // colliding with the expand-toggle.
+        var spotBucketModes = [
+          { v: 'day', label: 'Day' },
+          { v: 'week', label: 'Week' },
+          { v: 'month', label: 'Month' },
+          { v: 'dow', label: 'DoW' },
+          { v: 'hour', label: 'Time' }
+        ];
+        var spotValueModes = [
+          { v: 'absolute', label: 'Count' },
+          { v: 'normalized', label: '%' }
+        ];
+        html += '<div style="display: flex; gap: 8px; flex-wrap: wrap; margin: 6px 0 10px;">';
+        html += '<div style="display: inline-flex; gap: 2px; flex-wrap: wrap;">';
+        spotBucketModes.forEach(function(m) {
+          var active = m.v === spotlightBucket ? ' active' : '';
+          html += '<button class="stats-tab' + active + '" data-spotlight-bucket="' + m.v + '" style="font-size: 10px; padding: 3px 8px;">' + m.label + '</button>';
+        });
+        html += '</div>';
+        html += '<div style="display: inline-flex; gap: 2px;">';
+        spotValueModes.forEach(function(m) {
+          var active = m.v === spotlightValue ? ' active' : '';
+          html += '<button class="stats-tab' + active + '" data-spotlight-value="' + m.v + '" style="font-size: 10px; padding: 3px 8px;">' + m.label + '</button>';
+        });
+        html += '</div>';
+        html += '</div>';
+        html += '<div style="height: 200px; position: relative;"><canvas data-spotlight-canvas="' + escapeHtml(p.name) + '"></canvas></div>';
         html += '</div>';
       }
 
@@ -11397,6 +12093,61 @@
     else if (currentStatsTab === 'insights') content.innerHTML = renderStatsInsights();
     else if (currentStatsTab === 'matches') content.innerHTML = renderStatsMatches();
     wireStatsFilters(renderStats);
+
+    // v2.4.0: Overview trend card wiring. Three pieces:
+    //   1. Range dropdown — switches overviewCardRange + re-renders.
+    //   2. Mode segmented buttons — switches overviewCardMode + re-renders.
+    //   3. Chart.js instantiation for canvas modes (heroes/roles/queue).
+    // Only runs when on the Overview tab; the elements exist there only.
+    if (currentStatsTab === 'overview') {
+      var rangeSel = document.getElementById('overview-card-range');
+      if (rangeSel) {
+        rangeSel.addEventListener('change', function(e) {
+          var v = e.target.value;
+          // Numeric ranges stay as numbers; 'all'/'dow'/'hour' stay as strings.
+          var asNum = parseInt(v, 10);
+          overviewCardRange = isNaN(asNum) ? v : asNum;
+          renderStats();
+        });
+      }
+      document.querySelectorAll('[data-overview-mode]').forEach(function(btn) {
+        btn.addEventListener('click', function() {
+          overviewCardMode = btn.getAttribute('data-overview-mode');
+          renderStats();
+        });
+      });
+      // Canvas-based modes: instantiate the Chart.js stacked area. The canvas
+      // carries the params via data-* attrs so we don't need a parallel
+      // global. autoBucketMode picks day/week/month based on the windowed
+      // matches' calendar span — gives roughly 12-20 buckets.
+      var canvas = document.getElementById('overview-card-canvas');
+      if (canvas) {
+        var allFiltered = filteredMatches();
+        var sorted = allFiltered.slice().sort(function(a, b) { return a.ts - b.ts; });
+        // Match the rangeWindow logic from the markup builder above:
+        // cyclical → all matches; linear → most-recent N.
+        var bucketChoice = canvas.dataset.bucket;
+        var windowed;
+        if (bucketChoice === 'dow' || bucketChoice === 'hour' || overviewCardRange === 'all') {
+          windowed = sorted;
+        } else {
+          windowed = sorted.slice(Math.max(0, sorted.length - overviewCardRange));
+        }
+        var bucketers = stackedAreaBucketers();
+        var extractors = bandExtractors();
+        var bucketMode = (bucketChoice === 'auto') ? autoBucketMode(windowed) : bucketChoice;
+        var series = buildStackedAreaSeries(windowed, {
+          bucketer: bucketers[bucketMode],
+          extractor: extractors[canvas.dataset.extractor],
+          palette: canvas.dataset.palette,
+          topN: parseInt(canvas.dataset.topn, 10),
+          soloLabel: canvas.dataset.soloLabel === '1',
+          includeOther: canvas.dataset.includeOther === '1',
+          domain: cyclicalDomain(bucketMode) // null for linear modes; full domain for dow/hour
+        });
+        renderStackedArea(canvas, series, { mode: 'absolute', height: 180, legend: true });
+      }
+    }
     // Sort dropdowns (Heroes / Teammates / Maps tabs)
     ['sort-heroes', 'sort-maps'].forEach(function(id) {
       var el = document.getElementById(id);
@@ -11488,6 +12239,55 @@
         renderStats();
       });
     });
+
+    // v2.4.0: Synergy spotlight controls. Bucket/value buttons inside any
+    // expanded card update per-account state and re-render. The card-expand
+    // handler above already excludes button clicks, so no propagation hack
+    // is needed here.
+    document.querySelectorAll('#stats-content [data-spotlight-bucket]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        state.synergySpotlightBucket = btn.getAttribute('data-spotlight-bucket');
+        saveState();
+        renderStats();
+      });
+    });
+    document.querySelectorAll('#stats-content [data-spotlight-value]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        state.synergySpotlightValue = btn.getAttribute('data-spotlight-value');
+        saveState();
+        renderStats();
+      });
+    });
+
+    // v2.4.0: Synergy spotlight Chart.js instantiation. Walks every visible
+    // spotlight canvas (one per expanded teammate card) and feeds matches
+    // through the shared renderer using a roleOfTeammate extractor closure
+    // bound to that card's teammate. Each call adds the chart to
+    // chartInstances so destroyCharts() cleans them up on re-render.
+    document.querySelectorAll('#stats-content [data-spotlight-canvas]').forEach(function(canvas) {
+      var teammateName = canvas.getAttribute('data-spotlight-canvas');
+      var bucketers = stackedAreaBucketers();
+      var extractors = bandExtractors();
+      var bucketMode = state.synergySpotlightBucket || 'week';
+      var valueMode = state.synergySpotlightValue || 'absolute';
+      // Use the filtered match set so the spotlight respects season / role /
+      // hero / map filters consistent with the rest of Synergy. The closure
+      // produced by extractors.roleOfTeammate(name) is the key piece — it
+      // emits empty arrays for matches where the teammate wasn't present,
+      // so those matches simply don't contribute to any band.
+      var matches = filteredMatches();
+      var series = buildStackedAreaSeries(matches, {
+        bucketer: bucketers[bucketMode],
+        extractor: extractors.roleOfTeammate(teammateName),
+        palette: 'role',
+        topN: 3,
+        soloLabel: false,
+        includeOther: false,
+        domain: cyclicalDomain(bucketMode)
+      });
+      renderStackedArea(canvas, series, { mode: valueMode, height: 200, legend: true });
+    });
+
     // ==== Comp Builder event handlers ====
     document.querySelectorAll('#stats-content [data-cbrole]').forEach(function(btn) {
       btn.addEventListener('click', function() {
@@ -13048,17 +13848,127 @@
     });
   }
 
+  // ============================================================================
+  // === RENDER: Trends > Teammates (v2.4.0) ===================================
+  // ============================================================================
+  // Stacked-area chart of who you played with over time. Sister to the Overview
+  // card but with full controls — bucket mode and value mode are user-picked
+  // rather than auto-derived. Renders into #trends-content like the other
+  // Trends sub-tabs.
+
+  function renderTrendsTeammates() {
+    var container = document.getElementById('trends-content');
+    if (!container) return;
+
+    // Respect the global Stats filter set so users can narrow to season / map / role.
+    // Filter wiring is hooked in renderTrends() (Day/Hour/Teammates all share it).
+    var all = filteredMatches();
+
+    // Resolve current bucket + value mode from state (per-account, persisted
+    // by accountFlush at save boundaries).
+    var bucketMode = state.trendsTeammatesBucket || 'week';
+    var valueMode = state.trendsTeammatesValue || 'absolute';
+
+    // Controls strip. Bucket modes as a 5-button segmented control, value
+    // modes as a 2-button toggle. Reuses .stats-tab styling per the
+    // established pattern. Compact: 4px padding, smaller font.
+    var bucketModes = [
+      { v: 'day', label: 'Day' },
+      { v: 'week', label: 'Week' },
+      { v: 'month', label: 'Month' },
+      { v: 'dow', label: 'Day of week' },
+      { v: 'hour', label: 'Time of day' }
+    ];
+    var valueModes = [
+      { v: 'absolute', label: 'Count' },
+      { v: 'normalized', label: '% share' }
+    ];
+    var bucketBtnHtml = '<div style="display: inline-flex; gap: 2px; flex-wrap: wrap;" id="trends-tm-buckets">';
+    bucketModes.forEach(function(m) {
+      var active = m.v === bucketMode ? ' active' : '';
+      bucketBtnHtml += '<button class="stats-tab' + active + '" data-tm-bucket="' + m.v + '" style="font-size: 11px; padding: 4px 10px;">' + m.label + '</button>';
+    });
+    bucketBtnHtml += '</div>';
+    var valueBtnHtml = '<div style="display: inline-flex; gap: 2px;" id="trends-tm-values">';
+    valueModes.forEach(function(m) {
+      var active = m.v === valueMode ? ' active' : '';
+      valueBtnHtml += '<button class="stats-tab' + active + '" data-tm-value="' + m.v + '" style="font-size: 11px; padding: 4px 10px;">' + m.label + '</button>';
+    });
+    valueBtnHtml += '</div>';
+
+    var out = renderFilters();
+    out += '<div style="margin-bottom: 12px;">';
+    out += '<div class="eyebrow" style="margin-bottom: 6px;">Teammate composition over time</div>';
+    out += '<div class="caption">Who you queued with, by ' +
+      (bucketMode === 'dow' ? 'day of week' :
+       bucketMode === 'hour' ? 'time of day' : bucketMode) + '. ' +
+      (valueMode === 'normalized' ? 'Stacked share — each column always reaches 100%.'
+                                  : 'Raw game counts — column heights reflect total play volume.') +
+      '</div>';
+    out += '<div style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center; margin: 8px 0 12px;">' +
+      '<div style="display: flex; gap: 4px; align-items: center;"><span class="label-xs">Bucket:</span>' + bucketBtnHtml + '</div>' +
+      '<div style="display: flex; gap: 4px; align-items: center;"><span class="label-xs">Mode:</span>' + valueBtnHtml + '</div>' +
+    '</div>';
+
+    if (all.length === 0) {
+      out += '<div class="empty-state">No matches in this filter.</div></div>';
+      container.innerHTML = out;
+      return;
+    }
+
+    out += '<div style="height: 320px; position: relative;"><canvas id="trends-teammates-canvas"></canvas></div>';
+    out += '</div>';
+    container.innerHTML = out;
+
+    // Instantiate the Chart now that the canvas is in the DOM.
+    var canvas = document.getElementById('trends-teammates-canvas');
+    if (canvas) {
+      var bucketers = stackedAreaBucketers();
+      var extractors = bandExtractors();
+      var series = buildStackedAreaSeries(all, {
+        bucketer: bucketers[bucketMode],
+        extractor: extractors.teammate,
+        palette: 'categorical',
+        topN: 6,
+        soloLabel: true,
+        includeOther: true,
+        domain: cyclicalDomain(bucketMode)
+      });
+      renderStackedArea(canvas, series, { mode: valueMode, height: 320, legend: true });
+    }
+
+    // Wire bucket + value mode buttons. Update state, re-render the whole
+    // tab (light operation — destroyCharts + single re-render).
+    container.querySelectorAll('[data-tm-bucket]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        state.trendsTeammatesBucket = btn.getAttribute('data-tm-bucket');
+        saveState();
+        destroyCharts();
+        renderTrendsTeammates();
+      });
+    });
+    container.querySelectorAll('[data-tm-value]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        state.trendsTeammatesValue = btn.getAttribute('data-tm-value');
+        saveState();
+        destroyCharts();
+        renderTrendsTeammates();
+      });
+    });
+  }
+
   function renderTrends() {
     document.querySelectorAll('.trends-tab').forEach(t => t.classList.toggle('active', t.dataset.trends === currentTrendsTab));
     destroyCharts();
     if (currentTrendsTab === 'day') renderTrendsDay();
     else if (currentTrendsTab === 'hour') renderTrendsHour();
+    else if (currentTrendsTab === 'teammates') renderTrendsTeammates();
     else if (currentTrendsTab === 'best') renderTrendsBest();
     else if (currentTrendsTab === 'streaks') renderTrendsStreaks();
-    // Wire filter handlers for tabs that include the filter row (day, hour).
+    // Wire filter handlers for tabs that include the filter row (day, hour, teammates).
     // Best and Streaks aggregate across all matches in ways that don't naturally
     // accept the same filter set, so they don't render filters.
-    if (currentTrendsTab === 'day' || currentTrendsTab === 'hour') {
+    if (currentTrendsTab === 'day' || currentTrendsTab === 'hour' || currentTrendsTab === 'teammates') {
       wireStatsFilters(renderTrends);
     }
   }

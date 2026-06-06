@@ -1,0 +1,4 @@
+# Keep line endings stable across machines. The deployed app is served as-is by
+# GitHub Pages, so normalize HTML (and text) to LF in the repo and on checkout.
+* text=auto eol=lf
+*.html text eol=lf

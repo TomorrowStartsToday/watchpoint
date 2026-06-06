@@ -1,0 +1,12 @@
+# App-only repository.
+# GitHub Pages serves this repo's root, so we track ONLY the deployed app, the
+# custom-domain file, and repo hygiene. Everything else — local dev scaffolding
+# (CLAUDE.md, .claude/, tools/, BACKLOG.md, CHANGELOG.md, docs/, Design Files/)
+# and the versioned working archives (Watchpoint_v*.html) — stays local.
+# Version history lives in git tags + GitHub Releases.
+/*
+!/.gitignore
+!/.gitattributes
+!/index.html
+!/CNAME
+!/README.md

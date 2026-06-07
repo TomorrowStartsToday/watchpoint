@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Watchpoint — Game Tracker (v2.5.1)</title>
+<title>Watchpoint — Game Tracker (v2.6.0)</title>
 <!-- v2.0.0-11: Inter + JetBrains Mono per the design system. preconnect speeds up the
      handshake; the actual stylesheet is loaded async with display=swap so first paint
      never blocks on Google's response. If Google Fonts is blocked or slow, the
@@ -2870,7 +2870,7 @@
       <span class="wp-account-pill" id="wp-account-pill" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false" aria-label="Switch account"></span>
       <div class="wp-account-menu" id="wp-account-menu" role="listbox"></div>
     </span>
-    <span class="wp-version">v2.5.1</span>
+    <span class="wp-version">v2.6.0</span>
   </div>
   <h2 class="sr-only">Watchpoint — Overwatch match tracker and analytics</h2>
 
@@ -2946,6 +2946,11 @@
           <div id="map-grid" style="display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 3px;"></div>
         </div>
       </div>
+
+      <!-- WP-005 B2: Advanced-mode lineup capture (scoreboard). Replaces the teammate
+           accordion + hero panels when Advanced mode is on. Populated by
+           renderLineupCapture(); stays display:none in classic mode. -->
+      <div id="lineup-capture" style="display: none;"></div>
 
       <!-- v2.0.0-13b: Teammates accordion. Same pattern as Map. Header summary shows
            tagged teammates inline (with role superscripts) and a T/D/S count tally
@@ -3197,7 +3202,13 @@
 
     <div style="background: var(--color-background-secondary); padding: 1.25rem; border-radius: var(--border-radius-md); margin-bottom: 1rem;">
       <div class="section-header mb-sm">Experimental features</div>
-      <div style="font-size: 12px; color: var(--color-text-tertiary); font-style: italic;">No experimental features available right now.</div>
+      <label style="display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-size: 13px;">
+        <input type="checkbox" id="advanced-mode-toggle" style="margin-top: 3px; width: auto;" />
+        <span>
+          <span style="font-weight: 500; display: block;">Advanced mode</span>
+          <span style="color: var(--color-text-secondary); font-size: 12px; display: block; margin-top: 2px; line-height: 1.5;">Unlocks richer per-match team tracking and analytics (full lineup, hero swaps, enemy comp). Still being built — more lands soon. Off by default; toggling it never affects your existing data.</span>
+        </span>
+      </label>
     </div>
 
     <div style="background: var(--color-background-secondary); padding: 1.25rem; border-radius: var(--border-radius-md);">
@@ -3292,7 +3303,7 @@
   // saves. Adding a global field needs no change here — it's just on freshState.
   const ACCOUNT_FIELDS = [
     'matchLog', 'teammates', 'stats', 'excluded',
-    'lastPick', 'currentMatch', 'currentHeroes', 'currentMap', 'currentSide',
+    'lastPick', 'currentMatch', 'currentHeroes', 'currentLineup', 'currentMap', 'currentSide',
     'queuedRoles', 'lastActiveRole', 'customAdded', 'customRemoved',
     'currentSeasonId', 'seasonFilter', 'playUI',
     'drunkMode', 'sleepyMode', 'highMode', 'sickMode', 'periodMode', 'consoleMode',
@@ -3334,6 +3345,7 @@
       lastPick: { tank: null, damage: null, support: null },
       currentMatch: {},
       currentHeroes: [],
+      currentLineup: null, // WP-005: advanced-mode in-progress lineup (null = classic capture)
       currentMap: null,
       currentSide: null,
       queuedRoles: [],
@@ -3410,6 +3422,10 @@
       // Phase 2.7: theme preference. 'auto' follows system, 'light'/'dark' force.
       // Default 'auto' matches the existing v1.3.x behavior (system follow via media query).
       theme: 'auto',
+      // WP-004: global Advanced-mode flag — gates the experimental per-match team tracking
+      // (WP-005) + full-comp analytics (WP-006). Global like theme (one switch across all
+      // accounts), NOT per-account. Off by default; only gates UI, never collects data itself.
+      advancedModeEnabled: false,
       // Phase 3.3: patch/season tracking. Each season is { id, name, startTs, endTs|null }.
       // Seasons stay global — they're game-wide concepts (OW Season 1, Season 2),
       // shared identically across all accounts on this device.
@@ -3670,6 +3686,10 @@
   let alteredStateFilter = { drunk: false, sleepy: false, high: false, sick: false }; // Insights tab filter
   let currentMapModeFilter = 'all';
   let awaitingResult = false;
+  // WP-005 B2: which inline lineup picker is open. {team:'ally'|'enemy', slot:0-4, kind:'who'|'hero'} | null
+  let openLineupPicker = null;
+  // WP-005 Phase D: is the optional "rate teammates" meta strip expanded? (per-session)
+  let lineupMetaOpen = true;
   let leaverTagged = false;
   let commsTagged = false;
   let drunkTagged = false; // Per-match drunk flag (used when editing an existing match)
@@ -3893,6 +3913,7 @@
     if (!state.teammates) state.teammates = [];
     if (!state.currentMatch) state.currentMatch = {};
     if (!state.currentHeroes) state.currentHeroes = [];
+    if (state.currentLineup === undefined) state.currentLineup = null; // WP-005
     if (!state.matchLog) state.matchLog = [];
     if (state.currentMap === undefined) state.currentMap = null;
     if (state.currentSide === undefined) state.currentSide = null;
@@ -3900,6 +3921,8 @@
     if (!state.customRemoved) state.customRemoved = { tank: [], damage: [], support: [] };
     // Phase 2.7: backfill theme for users coming from v1.3.2 / v2.0.0-1 saves.
     if (state.theme !== 'light' && state.theme !== 'dark' && state.theme !== 'auto') state.theme = 'auto';
+    // WP-004: backfill the global Advanced-mode flag for pre-existing saves.
+    if (typeof state.advancedModeEnabled !== 'boolean') state.advancedModeEnabled = false;
     // Phase 3.3: backfill season fields. seasons stays [] until the user adds one;
     // currentSeasonId stays null until the user marks one current.
     if (!Array.isArray(state.seasons)) state.seasons = [];
@@ -5860,15 +5883,51 @@
     saveState(); render();
   }
 
+  // WP-005: derive the legacy match fields from an advanced lineup. `heroes` = the
+  // You ally's hero trail; `teammates` = {name: role} for named allies (excludes
+  // 'You' and the reusable '__random__' placeholder, so randoms never enter
+  // people/teammate stats); `myRole` = the You ally's role. Keeping these on the
+  // record means every existing reader (matchHeroes, m.teammates, synergy, the
+  // Lineup explorer, rebuildDerivedStats) works unchanged.
+  function deriveLineupLegacy(lu) {
+    var allies = (lu && lu.allies) || [];
+    var you = null;
+    for (var i = 0; i < allies.length; i++) { if (allies[i].player === 'You') { you = allies[i]; break; } }
+    var teammates = {};
+    allies.forEach(function(a) {
+      if (a.player && a.player !== 'You' && a.player !== '__random__' && a.role) {
+        teammates[a.player] = a.role;
+      }
+    });
+    return {
+      heroes: you && Array.isArray(you.heroes) ? you.heroes.slice() : [],
+      teammates: teammates,
+      myRole: you ? you.role : null
+    };
+  }
+
   function recordResult(won) {
-    const heroes = state.currentHeroes.slice();
+    // WP-005: in Advanced mode with a captured lineup, derive the legacy match
+    // fields (heroes / teammates / role) from state.currentLineup so all existing
+    // analytics + caches keep working unchanged; otherwise use classic capture.
+    var advLineup = (state.advancedModeEnabled && state.currentLineup) ? state.currentLineup : null;
+    var heroes, teammates, roleForRecord;
+    if (advLineup) {
+      var derived = deriveLineupLegacy(advLineup);
+      heroes = derived.heroes;
+      teammates = derived.teammates;
+      roleForRecord = derived.myRole || currentRole;
+    } else {
+      heroes = state.currentHeroes.slice();
+      teammates = Object.assign({}, state.currentMatch);
+      roleForRecord = currentRole;
+    }
     if (heroes.length === 0) return;
     heroes.forEach(hero => {
       if (!state.stats[hero]) state.stats[hero] = { plays: 0, wins: 0, losses: 0 };
       state.stats[hero].plays++;
       if (won) state.stats[hero].wins++; else state.stats[hero].losses++;
     });
-    const teammates = Object.assign({}, state.currentMatch);
     Object.keys(teammates).forEach(name => {
       const role = teammates[name];
       const tm = state.teammates.find(t => t.name === name);
@@ -5889,7 +5948,7 @@
       // Phase 3.3: tag with current season if one is set; null otherwise (bucketed as
       // "Pre-tracking" in the season filter — same bucket as existing legacy matches).
       seasonId: state.currentSeasonId,
-      myRole: currentRole,
+      myRole: roleForRecord,
       heroes: heroes, won: won, teammates: teammates,
       map: state.currentMap, side: state.currentSide,
       leaver: leaverTagged || false,
@@ -5909,6 +5968,9 @@
     // object so saves stay lean and existing match-introspection code that
     // checks `m.note` for truthiness works without changes.
     if (noteTagged && noteTagged.trim()) newMatch.note = noteTagged.trim();
+    // WP-005: persist the full advanced lineup (deep-copied so a later match can't
+    // mutate this record). Legacy matches simply omit it.
+    if (advLineup) newMatch.lineup = JSON.parse(JSON.stringify(advLineup));
     var expected = computeMatchExpectedWR(newMatch, state.matchLog);
     newMatch.expectedWR = expected !== null ? Math.round(expected * 1000) / 1000 : null;
     state.matchLog.push(newMatch);
@@ -5918,6 +5980,7 @@
     awaitingResult = false;
     state.currentMatch = {};
     state.currentHeroes = [];
+    state.currentLineup = null; // WP-005
     state.currentMap = null;
     state.currentSide = null;
     // v2.0.0-13b: reset Play tab accordions to open so the next match's data
@@ -5935,6 +5998,7 @@
     state.lastPick[currentRole] = null;
     state.currentMatch = {};
     state.currentHeroes = [];
+    state.currentLineup = null; // WP-005
     state.currentMap = null;
     state.currentSide = null;
     // v2.0.0-13b: same reset as recordResult — accordions reopen for the next match.
@@ -6341,6 +6405,7 @@
     awaitingResult = false;
     state.currentMatch = {};
     state.currentHeroes = [];
+    state.currentLineup = null; // WP-005
     state.currentMap = null;
     state.currentSide = null;
     leaverTagged = false;
@@ -6381,6 +6446,7 @@
     awaitingResult = false;
     state.currentMatch = {};
     state.currentHeroes = [];
+    state.currentLineup = null; // WP-005
     state.currentMap = null;
     state.currentSide = null;
     leaverTagged = false;
@@ -6421,6 +6487,208 @@
   // (tagged teammates as inline role-colored chips) + role count tally on the right,
   // toggles open/closed based on state.playUI.teammatesOpen, and delegates body
   // content rendering to renderTeammateChips() (unchanged from prior versions).
+  // ===== WP-005 B2: Advanced-mode lineup capture (Scoreboard layout) ==========
+  // Renders the #lineup-capture container when Advanced mode is on, replacing the
+  // role tabs + hero panels + teammate accordion + heroes-played. Writes the
+  // in-progress state.currentLineup; recordResult() derives the legacy fields.
+  var SLOT_ROLES = ['tank', 'damage', 'damage', 'support', 'support'];
+  var LC_ROLE_LABEL = { tank: 'T', damage: 'D', support: 'S' };
+  var LC_ROLE_VAR = { tank: 'var(--wp-tank)', damage: 'var(--wp-damage)', support: 'var(--wp-support)' };
+
+  function blankLineup() {
+    return {
+      allies: SLOT_ROLES.map(function(r, i) { return { slot: i, role: r, player: null, heroes: [] }; }),
+      enemies: SLOT_ROLES.map(function(r, i) { return { slot: i, role: r, heroes: [] }; })
+    };
+  }
+  function ensureCurrentLineup() {
+    if (!state.currentLineup) {
+      var lu = blankLineup();
+      var idx = SLOT_ROLES.indexOf(state.lastActiveRole || 'tank');
+      if (idx < 0) idx = 0;
+      lu.allies[idx].player = 'You'; // seed You into the last-played role's slot
+      state.currentLineup = lu;
+    }
+    return state.currentLineup;
+  }
+  function lineupYouSlot() {
+    var lu = state.currentLineup; if (!lu) return null;
+    for (var i = 0; i < lu.allies.length; i++) { if (lu.allies[i].player === 'You') return lu.allies[i]; }
+    return null;
+  }
+  function lineupYouHasHero() { var y = lineupYouSlot(); return !!(y && y.heroes && y.heroes.length); }
+  function teammateGames(t) { var n = 0; var s = t.stats || {}; Object.keys(s).forEach(function(r) { n += (s[r].plays || 0); }); return n; }
+  function heroPlays(h) { return (state.stats && state.stats[h] && state.stats[h].plays) || 0; }
+
+  function assignWho(slotIdx, value) {
+    var lu = state.currentLineup; if (!lu || !lu.allies[slotIdx]) return;
+    if (value === 'You') {
+      lu.allies.forEach(function(x) { if (x.player === 'You') x.player = null; }); // single-use
+      lu.allies[slotIdx].player = 'You';
+      state.lastActiveRole = lu.allies[slotIdx].role; // your role follows the slot
+    } else {
+      lu.allies[slotIdx].player = value; // a name or '__random__'
+    }
+  }
+  function assignHero(team, slotIdx, hero) { // B2-ii: append a hero (a swap) to the slot's trail; dedupe consecutive
+    var lu = state.currentLineup; if (!lu) return;
+    var arr = team === 'enemy' ? lu.enemies : lu.allies;
+    var s = arr[slotIdx]; if (!s) return;
+    if (!s.heroes) s.heroes = [];
+    if (s.heroes[s.heroes.length - 1] !== hero) s.heroes.push(hero);
+  }
+  function clearHeroes(team, slotIdx) {
+    var lu = state.currentLineup; if (!lu) return;
+    var arr = team === 'enemy' ? lu.enemies : lu.allies;
+    if (arr[slotIdx]) arr[slotIdx].heroes = [];
+  }
+  function popHero(team, slotIdx, heroIdx) {
+    var lu = state.currentLineup; if (!lu) return;
+    var arr = team === 'enemy' ? lu.enemies : lu.allies;
+    var s = arr[slotIdx]; if (s && s.heroes) s.heroes.splice(heroIdx, 1);
+  }
+
+  function lcWhoLabel(p) { return p === 'You' ? 'You' : p === '__random__' ? '🎲 Random' : p ? escapeHtml(p) : '+ player'; }
+  function lcWhoChip(value, label, pinned) {
+    return '<button data-ll2-pickwho="' + escapeHtml(value) + '" style="font-size:12px;padding:5px 10px;border-radius:999px;background:var(--wp-surface-1);border:1px solid ' + (pinned ? 'var(--wp-accent)' : 'var(--wp-border)') + ';color:var(--wp-fg-1);cursor:pointer;font-weight:500;">' + label + '</button>';
+  }
+  // WP-008: hero button for the picker. For the YOU slot, restore the classic manual-grid info —
+  // raw WR% (≥10 games) or "N/10" progress, a contextual predicted-WR delta, and a ±3% border tint.
+  // Teammate/enemy slots stay plain (no personal WR there).
+  function lcHeroBtn(hero, isYou) {
+    var base = 'font-size:11px;border:1px solid var(--wp-border);border-radius:6px;background:var(--wp-surface-1);color:var(--wp-fg-1);cursor:pointer;';
+    if (!isYou) {
+      return '<button data-ll2-pickhero="' + escapeHtml(hero) + '" style="padding:6px 4px;' + base + 'white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + escapeHtml(hero) + '</button>';
+    }
+    var s = getStats(hero);
+    var rawWR = s.plays >= THRESHOLDS.rawWRDisplay ? Math.round((s.wins / s.plays) * 100) : null;
+    var ctx = null; try { ctx = computeHeroContextualWR(hero); } catch (e) {}
+    var left = rawWR !== null ? '<span style="color:' + wrColor(rawWR) + ';font-weight:600;">' + rawWR + '%</span>' : '<span style="color:var(--wp-fg-3);">' + s.plays + '/' + THRESHOLDS.rawWRDisplay + '</span>';
+    var right = '', tint = '';
+    if (ctx !== null && rawWR !== null) {
+      var d = ctx - rawWR;
+      if (d > 3) tint = 'border-left:3px solid var(--wp-win);'; else if (d < -3) tint = 'border-left:3px solid var(--wp-loss);';
+      if (d !== 0) right = '<span style="color:' + (d > 0 ? 'var(--wp-win)' : 'var(--wp-loss)') + ';">' + (d > 0 ? '+' : '') + d + '%</span>';
+    } else if (rawWR === null && ctx !== null) {
+      right = '<span style="color:var(--wp-fg-3);opacity:.8;">~' + ctx + '%</span>';
+    }
+    return '<button data-ll2-pickhero="' + escapeHtml(hero) + '" title="' + escapeHtml(hero) + (s.plays ? ' — ' + s.plays + 'G ' + s.wins + 'W-' + s.losses + 'L' : '') + '" style="display:flex;flex-direction:column;align-items:center;gap:1px;padding:5px 3px;' + base + tint + '"><span style="font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%;">' + escapeHtml(hero) + '</span><span style="font-size:9px;display:flex;gap:4px;">' + left + right + '</span></button>';
+  }
+  function lcPickerHTML(slot, role) {
+    var out = '<div style="padding:8px;margin:-1px 0 7px;background:var(--wp-surface-2);border:1px solid var(--wp-border);border-radius:8px;">';
+    if (openLineupPicker.kind === 'who') {
+      out += '<div style="font-size:11px;color:var(--wp-fg-3);margin-bottom:6px;">Who\'s in this ' + role.charAt(0).toUpperCase() + role.slice(1) + ' slot?</div>';
+      out += '<div style="display:flex;flex-wrap:wrap;gap:5px;">';
+      out += lcWhoChip('You', 'You', true) + lcWhoChip('__random__', '🎲 Random Player', true);
+      var placed = {}; state.currentLineup.allies.forEach(function(a) { if (a.player && a.player !== 'You' && a.player !== '__random__') placed[a.player] = true; });
+      (state.teammates || []).slice().sort(function(a, b) { return teammateGames(b) - teammateGames(a) || a.name.localeCompare(b.name); }).forEach(function(t) {
+        if (!placed[t.name]) out += lcWhoChip(t.name, escapeHtml(t.name) + ' <span style="color:var(--wp-fg-3);font-size:10px;">' + teammateGames(t) + 'G</span>', false);
+      });
+      out += '</div>';
+      out += '<div style="display:flex;gap:5px;margin-top:7px;"><input id="ll2-newname" type="text" placeholder="New player name" maxlength="40" style="flex:1;min-width:0;padding:5px 8px;font-size:12px;border:1px solid var(--wp-border);border-radius:6px;background:var(--wp-surface-1);color:var(--wp-fg-1);font-family:inherit;" /><button data-ll2-newadd="1" style="padding:5px 11px;font-size:12px;border:1px solid var(--wp-border);border-radius:6px;background:var(--wp-surface-3);color:var(--wp-fg-1);cursor:pointer;">Add</button></div>';
+    } else {
+      var lcS = (openLineupPicker.team === 'enemy' ? state.currentLineup.enemies : state.currentLineup.allies)[slot];
+      var trail = (lcS && lcS.heroes) || [];
+      if (trail.length) {
+        out += '<div style="font-size:11px;color:var(--wp-fg-3);margin-bottom:5px;">Heroes this game — tap &times; to remove:</div><div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px;">';
+        trail.forEach(function(h, hi) {
+          out += '<span style="display:inline-flex;align-items:center;gap:4px;font-size:12px;padding:4px 5px 4px 10px;border-radius:999px;background:var(--wp-surface-1);border:1px solid var(--wp-border);">' + escapeHtml(h) + '<button data-ll2-pophero="' + hi + '" title="Remove" style="background:none;border:none;color:var(--wp-fg-3);cursor:pointer;font-size:13px;line-height:1;padding:0 2px;">&times;</button></span>';
+        });
+        out += '</div>';
+      }
+      var isYouSlot = openLineupPicker.team === 'ally' && lcS && lcS.player === 'You';
+      out += '<div style="font-size:11px;color:var(--wp-fg-3);margin-bottom:6px;">' + (trail.length ? 'Add a swap — next ' : 'Pick a ') + role + ' hero' + (isYouSlot ? ' (your win-rate shown)' : '') + '</div>';
+      out += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:4px;">';
+      (HEROES[role] || []).slice().sort(function(a, b) { return a.localeCompare(b); }).forEach(function(h) {
+        out += lcHeroBtn(h, isYouSlot);
+      });
+      out += '<button data-ll2-pickhero="__clear__" style="padding:6px 4px;font-size:11px;border:1px dashed var(--wp-border);border-radius:6px;background:var(--wp-surface-1);color:var(--wp-fg-3);cursor:pointer;">— clear all</button>';
+      out += '</div>';
+    }
+    return out + '</div>';
+  }
+  function lcHeroTrail(heroes, rolC) {
+    if (!heroes || !heroes.length) return '+ hero';
+    return '<span style="width:13px;height:13px;border-radius:999px;background:' + rolC + ';flex:0 0 auto;"></span><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + heroes.map(function(h) { return escapeHtml(h); }).join(' <span style="color:var(--wp-fg-3);">&rarr;</span> ') + '</span>';
+  }
+  function lcAllyRow(a, i) {
+    var isYou = a.player === 'You';
+    var rolC = LC_ROLE_VAR[a.role];
+    var heroes = a.heroes || []; var heroEmpty = !heroes.length;
+    var out = '<div style="display:grid;grid-template-columns:22px 112px 1fr;gap:6px;align-items:center;margin-bottom:5px;padding:5px;border:1px solid ' + (isYou ? 'var(--wp-accent)' : 'var(--wp-border)') + ';border-radius:8px;background:' + (isYou ? 'var(--wp-accent-soft)' : 'var(--wp-surface-1)') + ';">';
+    out += '<div style="width:22px;height:22px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;background:' + rolC + ';">' + LC_ROLE_LABEL[a.role] + '</div>';
+    out += '<button data-ll2-team="ally" data-ll2-slot="' + i + '" data-ll2-kind="who" style="display:flex;align-items:center;gap:4px;background:' + (isYou ? 'var(--wp-accent-soft)' : 'var(--wp-surface-2)') + ';border:1px ' + (a.player ? 'solid' : 'dashed') + ' ' + (isYou ? 'var(--wp-accent)' : 'var(--wp-border)') + ';border-radius:999px;padding:5px 9px;font-size:12px;font-weight:600;color:' + (a.player ? 'var(--wp-fg-1)' : 'var(--wp-fg-3)') + ';cursor:pointer;min-width:0;"><span style="white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + lcWhoLabel(a.player) + '</span><span style="margin-left:auto;color:var(--wp-fg-3);font-size:9px;">▾</span></button>';
+    out += '<button data-ll2-team="ally" data-ll2-slot="' + i + '" data-ll2-kind="hero" style="display:flex;align-items:center;gap:6px;background:var(--wp-surface-2);border:1px ' + (heroEmpty ? 'dashed' : 'solid') + ' var(--wp-border);border-radius:6px;padding:5px 9px;font-size:12px;color:' + (heroEmpty ? 'var(--wp-fg-3)' : 'var(--wp-fg-1)') + ';cursor:pointer;min-width:0;' + (heroEmpty ? 'justify-content:center;' : '') + '">' + lcHeroTrail(heroes, rolC) + '</button>';
+    out += '</div>';
+    if (openLineupPicker && openLineupPicker.team === 'ally' && openLineupPicker.slot === i) out += lcPickerHTML(i, a.role);
+    return out;
+  }
+  function lcEnemyRow(e, i) {
+    var rolC = LC_ROLE_VAR[e.role];
+    var heroes = e.heroes || []; var heroEmpty = !heroes.length;
+    var out = '<div style="display:grid;grid-template-columns:22px 1fr;gap:6px;align-items:center;margin-bottom:5px;padding:5px;border:1px solid var(--wp-border-soft);border-radius:8px;background:var(--wp-surface-1);">';
+    out += '<div style="width:22px;height:22px;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:#fff;background:' + rolC + ';">' + LC_ROLE_LABEL[e.role] + '</div>';
+    out += '<button data-ll2-team="enemy" data-ll2-slot="' + i + '" data-ll2-kind="hero" style="display:flex;align-items:center;gap:6px;background:var(--wp-surface-2);border:1px ' + (heroEmpty ? 'dashed' : 'solid') + ' var(--wp-border);border-radius:6px;padding:5px 9px;font-size:12px;color:' + (heroEmpty ? 'var(--wp-fg-3)' : 'var(--wp-fg-1)') + ';cursor:pointer;min-width:0;' + (heroEmpty ? 'justify-content:center;' : '') + '">' + lcHeroTrail(heroes, rolC) + '</button>';
+    out += '</div>';
+    if (openLineupPicker && openLineupPicker.team === 'enemy' && openLineupPicker.slot === i) out += lcPickerHTML(i, e.role);
+    return out;
+  }
+  // WP-005 Phase D: optional post-game meta per ALLY teammate (endorsement / hero level /
+  // participation 1–5). Stored on lineup.allies[]; recordResult deep-copies it and
+  // deriveLineupLegacy ignores it (purely additive). Only named teammates (not You / 🎲 random)
+  // are rateable.
+  function assignMeta(slotIdx, field, value) {
+    var lu = state.currentLineup; if (!lu || !lu.allies[slotIdx]) return;
+    var a = lu.allies[slotIdx];
+    if (value === null || value === '' || (typeof value === 'number' && isNaN(value))) delete a[field];
+    else a[field] = value;
+  }
+  function lcMetaPills(slotIdx, field, current) {
+    var out = '';
+    for (var v = 1; v <= 5; v++) {
+      var on = current === v;
+      out += '<button data-ll2-meta="' + field + '" data-ll2-metaslot="' + slotIdx + '" data-ll2-metaval="' + v + '" style="width:24px;height:24px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:1px solid ' + (on ? 'var(--wp-accent)' : 'var(--wp-border)') + ';background:' + (on ? 'var(--wp-accent-soft)' : 'var(--wp-surface-1)') + ';color:' + (on ? 'var(--wp-fg-1)' : 'var(--wp-fg-3)') + ';">' + v + '</button>';
+    }
+    return out;
+  }
+  function lcMetaEditor() {
+    var lu = state.currentLineup; if (!lu) return '';
+    // WP-010: rate ANY ally slot that has a hero (named teammates, You, and 🎲 randoms) so the user
+    // can flag carry-heavy heroes. "Carried" (participation) is skipped for the You slot (self-carry).
+    var rateable = lu.allies.filter(function(a) { return a.heroes && a.heroes.length; });
+    if (!rateable.length) return '';
+    if (!lineupMetaOpen) {
+      // Prominent collapsed card — stands out like a section, not a faint link.
+      return '<div data-ll2-metatoggle="1" style="margin-top:12px;cursor:pointer;display:flex;align-items:center;justify-content:space-between;background:var(--wp-surface-1);border:1px solid var(--wp-border);border-radius:8px;padding:10px 12px;"><div><div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;color:var(--wp-fg-2);">Rate players</div><div style="font-size:11px;color:var(--wp-fg-3);margin-top:1px;">endorsement &middot; hero level &middot; carried — optional</div></div><span style="color:var(--wp-fg-3);font-size:13px;">&#9656;</span></div>';
+    }
+    var out = '<div style="margin-top:12px;background:var(--wp-surface-1);border:1px solid var(--wp-border);border-radius:8px;padding:10px 12px;">';
+    out += '<div data-ll2-metatoggle="1" style="cursor:pointer;display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;"><div style="font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;color:var(--wp-fg-2);">Rate players <span style="text-transform:none;font-weight:400;color:var(--wp-fg-3);">— optional, tap a value again to clear</span></div><span style="color:var(--wp-fg-3);font-size:13px;">&#9662;</span></div>';
+    lu.allies.forEach(function(a, i) {
+      if (!a.heroes || !a.heroes.length) return;
+      var isYou = a.player === 'You';
+      var who = isYou ? 'You' : (a.player && a.player !== '__random__') ? escapeHtml(a.player) : '🎲 Random';
+      var lastHero = a.heroes[a.heroes.length - 1];
+      out += '<div style="padding:8px 9px;margin-bottom:6px;background:var(--wp-surface-2);border:1px solid var(--wp-border);border-radius:8px;">';
+      out += '<div style="font-weight:600;font-size:12px;margin-bottom:7px;">' + who + ' <span style="color:var(--wp-fg-3);font-weight:400;">&middot; ' + escapeHtml(lastHero) + '</span></div>';
+      out += '<div style="display:flex;align-items:center;gap:5px;margin-bottom:6px;"><span style="font-size:11px;color:var(--wp-fg-3);width:78px;flex:0 0 auto;">Endorsement</span>' + lcMetaPills(i, 'endorsement', a.endorsement) + '</div>';
+      out += '<div style="display:flex;align-items:center;gap:5px;margin-bottom:6px;flex-wrap:wrap;"><span style="font-size:11px;color:var(--wp-fg-3);width:78px;flex:0 0 auto;">Carried</span>' + lcMetaPills(i, 'participation', a.participation) + '<span style="font-size:10px;color:var(--wp-fg-muted);margin-left:4px;">' + (isYou ? '1 = got carried &rarr; 5 = you popped off' : '1 = they carried &rarr; 5 = you carried') + '</span></div>';
+      out += '<div style="display:flex;align-items:center;gap:5px;"><span style="font-size:11px;color:var(--wp-fg-3);width:78px;flex:0 0 auto;">Hero level</span><input type="number" min="1" inputmode="numeric" data-ll2-metalevel="' + i + '" value="' + (a.heroLevel != null ? a.heroLevel : '') + '" placeholder="—" style="width:72px;padding:4px 6px;font-size:12px;border:1px solid var(--wp-border);border-radius:6px;background:var(--wp-surface-1);color:var(--wp-fg-1);font-family:inherit;" /></div>';
+      out += '</div>';
+    });
+    return out + '</div>';
+  }
+  function renderLineupCapture() {
+    var lu = ensureCurrentLineup();
+    var hdr = 'font-size:11px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;color:var(--wp-fg-3);margin:2px 0 6px;';
+    var html = '<div style="' + hdr + '">Your team</div>';
+    lu.allies.forEach(function(a, i) { html += lcAllyRow(a, i); });
+    html += '<div style="display:flex;align-items:center;gap:8px;margin:10px 0 6px;"><div style="flex:1;height:1px;background:var(--wp-border);"></div><span style="' + hdr + 'margin:0;color:var(--wp-loss);">Enemy</span><div style="flex:1;height:1px;background:var(--wp-border);"></div></div>';
+    lu.enemies.forEach(function(e, i) { html += lcEnemyRow(e, i); });
+    if (!lineupYouHasHero()) html += '<div style="font-size:11px;color:var(--wp-fg-3);font-style:italic;margin-top:6px;">Pick your hero (the highlighted row) to enable Win/Loss. Teammates &amp; enemies are optional.</div>';
+    html += lcMetaEditor();
+    document.getElementById('lineup-capture').innerHTML = html;
+  }
+
   function renderTeammateAccordion() {
     var section = document.getElementById('teammate-section');
     var summaryEl = document.getElementById('teammate-accordion-summary');
@@ -14648,6 +14916,8 @@
     // Sync experimental toggles to current state when the Data tab renders
     var ptToggle = document.getElementById('platform-tracking-toggle');
     if (ptToggle) ptToggle.checked = state.platformTrackingEnabled === true;
+    var amToggle = document.getElementById('advanced-mode-toggle');
+    if (amToggle) amToggle.checked = state.advancedModeEnabled === true;
 
     // Phase 2.7: sync active state of theme seg-control
     var themeButtons = document.querySelectorAll('#theme-control .seg-btn');
@@ -15270,6 +15540,11 @@
     // Top role tabs show queue membership (active = in queue). Bottom picker handles
     // active-role selection when 2+ roles are queued.
     var isEditingEarly = editingMatchIdx !== null;
+    // WP-005 B2: Advanced-mode capture. Init the in-progress lineup and derive
+    // awaitingResult from whether the You slot has a hero, so the existing
+    // action/tag/rating lifecycle works. Editing stays on the legacy flow for now.
+    var advCapture = state.advancedModeEnabled && !isEditingEarly;
+    if (advCapture) { ensureCurrentLineup(); awaitingResult = lineupYouHasHero(); }
     renderRoleTabs();
     renderQueuedRolePicker(isEditingEarly);
     document.getElementById('random-panel').style.display = currentPickMode === 'random' ? 'block' : 'none';
@@ -15421,6 +15696,17 @@
     renderTeammateAccordion();
     renderHeroesPlayed();
     renderManualGrid();
+    // WP-005 B2: swap the legacy capture sections for the lineup scoreboard when Advanced.
+    var lcEl = document.getElementById('lineup-capture');
+    if (advCapture) {
+      ['role-tabs', 'queued-role-picker', 'random-panel', 'manual-panel', 'teammate-section', 'heroes-played-section'].forEach(function(id) { var el = document.getElementById(id); if (el) el.style.display = 'none'; });
+      if (lcEl) { lcEl.style.display = 'block'; renderLineupCapture(); }
+    } else if (lcEl) {
+      lcEl.style.display = 'none';
+      // Restore the role tabs — their display isn't re-set by the legacy render path,
+      // so a prior Advanced render's display:none would otherwise stick.
+      var rtEl = document.getElementById('role-tabs'); if (rtEl) rtEl.style.display = 'grid';
+    }
     renderMapSection();
     renderQuickStats();
     renderInviteStrip();
@@ -15470,6 +15756,48 @@
   });
   document.getElementById('trends-tabs').addEventListener('click', (e) => {
     if (e.target.classList.contains('trends-tab')) { currentTrendsTab = e.target.dataset.trends; renderTrends(); }
+  });
+  // WP-005 B2: Advanced lineup capture — delegated clicks on the static #lineup-capture
+  // container (its innerHTML is rebuilt each render, but this listener persists).
+  document.getElementById('lineup-capture').addEventListener('click', function(e) {
+    var t = e.target.closest('[data-ll2-kind],[data-ll2-metatoggle],[data-ll2-meta],[data-ll2-pickwho],[data-ll2-pickhero],[data-ll2-pophero],[data-ll2-newadd]');
+    if (!t) return;
+    if (t.hasAttribute('data-ll2-kind')) {
+      var team = t.getAttribute('data-ll2-team'), slot = parseInt(t.getAttribute('data-ll2-slot'), 10), kind = t.getAttribute('data-ll2-kind');
+      openLineupPicker = (openLineupPicker && openLineupPicker.team === team && openLineupPicker.slot === slot && openLineupPicker.kind === kind) ? null : { team: team, slot: slot, kind: kind };
+      render(); return;
+    }
+    if (t.hasAttribute('data-ll2-metatoggle')) { lineupMetaOpen = !lineupMetaOpen; render(); return; }
+    if (t.hasAttribute('data-ll2-meta')) {
+      var mfield = t.getAttribute('data-ll2-meta'), mslot = parseInt(t.getAttribute('data-ll2-metaslot'), 10), mval = parseInt(t.getAttribute('data-ll2-metaval'), 10);
+      var ma = state.currentLineup && state.currentLineup.allies[mslot];
+      assignMeta(mslot, mfield, (ma && ma[mfield] === mval) ? null : mval); // tap the same value again to clear
+      saveState(); render(); return;
+    }
+    if (!openLineupPicker) return;
+    if (t.hasAttribute('data-ll2-pickwho')) { assignWho(openLineupPicker.slot, t.getAttribute('data-ll2-pickwho')); openLineupPicker = null; saveState(); render(); return; }
+    if (t.hasAttribute('data-ll2-pickhero')) {
+      var h = t.getAttribute('data-ll2-pickhero');
+      if (h === '__clear__') clearHeroes(openLineupPicker.team, openLineupPicker.slot); else assignHero(openLineupPicker.team, openLineupPicker.slot, h);
+      saveState(); render(); return; // keep the picker open for more swaps; tap the hero box to close
+    }
+    if (t.hasAttribute('data-ll2-pophero')) { popHero(openLineupPicker.team, openLineupPicker.slot, parseInt(t.getAttribute('data-ll2-pophero'), 10)); saveState(); render(); return; }
+    if (t.hasAttribute('data-ll2-newadd')) {
+      var inp = document.getElementById('ll2-newname'); var nm = (inp && inp.value || '').trim();
+      if (nm) {
+        if (!state.teammates.some(function(x) { return x.name.toLowerCase() === nm.toLowerCase(); })) state.teammates.push({ name: nm, stats: {} });
+        assignWho(openLineupPicker.slot, nm);
+      }
+      openLineupPicker = null; saveState(); render(); return;
+    }
+  });
+  // WP-005 Phase D: hero-level number input commits on change (blur).
+  document.getElementById('lineup-capture').addEventListener('change', function(e) {
+    var inp = e.target.closest('[data-ll2-metalevel]'); if (!inp) return;
+    var mslot = parseInt(inp.getAttribute('data-ll2-metalevel'), 10);
+    var v = parseInt(inp.value, 10);
+    assignMeta(mslot, 'heroLevel', (isNaN(v) || v < 1) ? null : v);
+    saveState();
   });
   document.getElementById('role-tabs').addEventListener('click', (e) => {
     // v2.0.0-13i: with the new role-tab markup containing inner SVG icon + spans,
@@ -15753,6 +16081,13 @@
     if (!state.platformTrackingEnabled) {
       state.consoleMode = false;
     }
+    saveState();
+    render();
+  });
+  // WP-004: Advanced-mode toggle (global). Gates the WP-005/006 experimental capture UI +
+  // analytics. No dependent-clear needed — it only gates UI, never collects data.
+  document.getElementById('advanced-mode-toggle').addEventListener('change', function(e) {
+    state.advancedModeEnabled = e.target.checked;
     saveState();
     render();
   });

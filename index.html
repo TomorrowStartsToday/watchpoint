@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Watchpoint — Game Tracker (v2.4.0)</title>
+<title>Watchpoint — Game Tracker (v2.4.1)</title>
 <!-- v2.0.0-11: Inter + JetBrains Mono per the design system. preconnect speeds up the
      handshake; the actual stylesheet is loaded async with display=swap so first paint
      never blocks on Google's response. If Google Fonts is blocked or slow, the
@@ -2870,7 +2870,7 @@
       <span class="wp-account-pill" id="wp-account-pill" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false" aria-label="Switch account"></span>
       <div class="wp-account-menu" id="wp-account-menu" role="listbox"></div>
     </span>
-    <span class="wp-version">v2.4.0</span>
+    <span class="wp-version">v2.4.1</span>
   </div>
   <h2 class="sr-only">Watchpoint — Overwatch match tracker and analytics</h2>
 
@@ -3565,6 +3565,7 @@
     ACCOUNT_FIELDS.forEach(function(key) {
       state[key] = active[key];
     });
+    rebuildDerivedStats(); // WP-002: rebuild derived caches for the now-active account (load/import/switch)
   }
 
   // accountSwitch — flush current account, swap active, hydrate target.
@@ -3968,6 +3969,7 @@
     // so loadState/import/clearAll all benefit. Per-mutation calls (recordResult,
     // saveMatchEdit, deleteMatch) hit rebuildIndices directly.
     rebuildIndices();
+    rebuildDerivedStats(); // WP-002: reconstruct stats/teammate caches (covers no-accounts path + self-heal)
   }
 
   // ============================================================================
@@ -4005,6 +4007,33 @@
         var mode = mapMode(m.map);
         if (mode) (indices.byMode[mode] = indices.byMode[mode] || []).push(m);
       }
+    });
+  }
+
+  // WP-002: rebuild the derived per-hero and per-teammate stat caches from matchLog.
+  // Mirrors the incremental updates in recordResult(); centralizing the rebuild lets the
+  // export drop these caches (reconstructed on load) and self-heals any drift on every load.
+  function rebuildDerivedStats() {
+    var hs = {};
+    (state.matchLog || []).forEach(function(m) {
+      (m.heroes || (m.hero ? [m.hero] : [])).forEach(function(h) {
+        if (!h) return;
+        if (!hs[h]) hs[h] = { plays: 0, wins: 0, losses: 0 };
+        hs[h].plays++; if (m.won) hs[h].wins++; else hs[h].losses++;
+      });
+    });
+    state.stats = hs;
+    var byName = {};
+    (state.teammates || []).forEach(function(t) { t.stats = {}; byName[t.name] = t; });
+    (state.matchLog || []).forEach(function(m) {
+      var tm = m.teammates || {};
+      Object.keys(tm).forEach(function(name) {
+        var t = byName[name];
+        if (!t) return; // name not in roster (e.g. removed teammate) — skip, matches prior behavior
+        var r = tm[name];
+        if (!t.stats[r]) t.stats[r] = { plays: 0, wins: 0, losses: 0 };
+        t.stats[r].plays++; if (m.won) t.stats[r].wins++; else t.stats[r].losses++;
+      });
     });
   }
 
@@ -14333,7 +14362,29 @@
     // serializing — otherwise the exported file would carry stale per-account
     // contents. Same fix as saveStateNow.
     accountFlush();
-    var data = JSON.stringify(state, null, 2);
+    // WP-002: export only durable data. Drop the top-level shadow (the active account is
+    // duplicated into accounts[]) and the derived caches (per-hero `stats`, per-teammate
+    // `.stats`) — all reconstructed on load by rebuildDerivedStats(). Build a fresh object;
+    // never mutate live `state`. Falls back to a full dump if accounts namespacing is absent.
+    var data;
+    if (Array.isArray(state.accounts) && state.accounts.length) {
+      var slimAccounts = state.accounts.map(function(a) {
+        var copy = Object.assign({}, a);
+        delete copy.stats; // derived (rebuilt on load)
+        copy.teammates = (a.teammates || []).map(function(t) { return { name: t.name }; }); // drop derived .stats
+        return copy;
+      });
+      data = JSON.stringify({
+        schemaVersion: state.schemaVersion,
+        _exportFormat: 2,
+        activeAccountId: state.activeAccountId,
+        theme: state.theme,
+        seasons: state.seasons,
+        accounts: slimAccounts
+      }, null, 2);
+    } else {
+      data = JSON.stringify(state, null, 2); // legacy fallback (pre-account-namespacing)
+    }
     var blob = new Blob([data], { type: 'application/json' });
     var url = URL.createObjectURL(blob);
 
@@ -14382,20 +14433,31 @@
   // so the user sees something better than "Import failed: undefined".
   function validateImport(parsed) {
     if (!parsed || typeof parsed !== 'object') throw new Error('Not an object.');
-    if (!Array.isArray(parsed.matchLog)) throw new Error('Missing matchLog array.');
-
     var validRoles = { tank: 1, damage: 1, support: 1 };
-    for (var i = 0; i < parsed.matchLog.length; i++) {
-      var m = parsed.matchLog[i];
-      if (!m || typeof m !== 'object') throw new Error('Match #' + (i + 1) + ' is not an object.');
-      if (typeof m.ts !== 'number' || !isFinite(m.ts)) throw new Error('Match #' + (i + 1) + ' has invalid ts.');
-      if (!validRoles[m.myRole]) throw new Error('Match #' + (i + 1) + ' has invalid myRole: ' + m.myRole);
-      if (typeof m.won !== 'boolean') throw new Error('Match #' + (i + 1) + ' has non-boolean won.');
-      if (!Array.isArray(m.heroes) && !m.hero) throw new Error('Match #' + (i + 1) + ' has no heroes.');
+    function validateMatchLog(ml, label) {
+      var where = label ? ' (' + label + ')' : '';
+      if (!Array.isArray(ml)) throw new Error('Missing matchLog array' + (label ? ' for ' + label : '') + '.');
+      for (var i = 0; i < ml.length; i++) {
+        var m = ml[i];
+        if (!m || typeof m !== 'object') throw new Error('Match #' + (i + 1) + where + ' is not an object.');
+        if (typeof m.ts !== 'number' || !isFinite(m.ts)) throw new Error('Match #' + (i + 1) + where + ' has invalid ts.');
+        if (!validRoles[m.myRole]) throw new Error('Match #' + (i + 1) + where + ' has invalid myRole: ' + m.myRole);
+        if (typeof m.won !== 'boolean') throw new Error('Match #' + (i + 1) + where + ' has non-boolean won.');
+        if (!Array.isArray(m.heroes) && !m.hero) throw new Error('Match #' + (i + 1) + where + ' has no heroes.');
+      }
     }
-
-    if (parsed.teammates !== undefined && !Array.isArray(parsed.teammates)) {
-      throw new Error('teammates must be an array if present.');
+    // WP-002: accept either the slim accounts-based shape (no top-level matchLog) or the
+    // legacy fat shape (top-level matchLog). A fat v5 file has both → validated via top-level.
+    if (Array.isArray(parsed.accounts) && parsed.accounts.length && !Array.isArray(parsed.matchLog)) {
+      parsed.accounts.forEach(function(a) {
+        validateMatchLog(a.matchLog, a.label || a.id || 'account');
+        if (a.teammates !== undefined && !Array.isArray(a.teammates)) throw new Error('teammates must be an array if present.');
+      });
+    } else {
+      validateMatchLog(parsed.matchLog, '');
+      if (parsed.teammates !== undefined && !Array.isArray(parsed.teammates)) {
+        throw new Error('teammates must be an array if present.');
+      }
     }
     return true;
   }
@@ -14408,7 +14470,14 @@
         validateImport(parsed); // throws with specific reason on bad input
         pendingImport = parsed;
         var msg = document.getElementById('data-msg');
-        msg.innerHTML = 'This will replace all data with ' + parsed.matchLog.length + ' matches and ' + (parsed.teammates || []).length + ' teammates. <button id="confirm-import-btn" style="margin-left: 6px; padding: 2px 10px; font-size: 12px;">Yes, import</button> <button id="cancel-import-btn" style="margin-left: 3px; padding: 2px 10px; font-size: 12px;">Cancel</button>';
+        // WP-002: slim exports have no top-level matchLog/teammates — sum across accounts.
+        var impMatches = Array.isArray(parsed.matchLog)
+          ? parsed.matchLog.length
+          : (parsed.accounts || []).reduce(function(s, a) { return s + ((a.matchLog || []).length); }, 0);
+        var impTeammates = Array.isArray(parsed.teammates)
+          ? parsed.teammates.length
+          : (parsed.accounts || []).reduce(function(s, a) { return s + ((a.teammates || []).length); }, 0);
+        msg.innerHTML = 'This will replace all data with ' + impMatches + ' matches and ' + impTeammates + ' teammates. <button id="confirm-import-btn" style="margin-left: 6px; padding: 2px 10px; font-size: 12px;">Yes, import</button> <button id="cancel-import-btn" style="margin-left: 3px; padding: 2px 10px; font-size: 12px;">Cancel</button>';
         document.getElementById('confirm-import-btn').addEventListener('click', function() {
           if (pendingImport) {
             state = pendingImport;

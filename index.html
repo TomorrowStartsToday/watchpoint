@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Watchpoint — Game Tracker (v2.4.1)</title>
+<title>Watchpoint — Game Tracker (v2.5.0)</title>
 <!-- v2.0.0-11: Inter + JetBrains Mono per the design system. preconnect speeds up the
      handshake; the actual stylesheet is loaded async with display=swap so first paint
      never blocks on Google's response. If Google Fonts is blocked or slow, the
@@ -2870,7 +2870,7 @@
       <span class="wp-account-pill" id="wp-account-pill" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false" aria-label="Switch account"></span>
       <div class="wp-account-menu" id="wp-account-menu" role="listbox"></div>
     </span>
-    <span class="wp-version">v2.4.1</span>
+    <span class="wp-version">v2.5.0</span>
   </div>
   <h2 class="sr-only">Watchpoint — Overwatch match tracker and analytics</h2>
 
@@ -3708,14 +3708,19 @@
   // Sort selection per-tab on Stats. Defaults match the original behaviors:
   // heroes/teammates/maps were all sorted by plays-desc with WR-desc tiebreak.
   let statsSort = { heroes: 'games', maps: 'games' };
-  // Currently-selected teammate for the Synergy > Pairing matrix subsection.
-  // Defaults to most-played teammate when first viewing; user can switch via dropdown.
-  let pairingMatrixTeammate = null;
   // v2.0.0-13ae: in-memory set of teammate names whose Synergy per-teammate cards
   // should render in expanded form (per-role bar breakdown vs collapsed sub-line).
   // Multiple cards can be expanded simultaneously. State is per-session; resets
   // on page reload but survives sub-tab switches within the session.
   let expandedTeammates = new Set();
+  // WP-003: Lineup explorer transient selection (lives in the Synergy tab where
+  // the pairing matrix used to). `people` = ordered teammate names (max 4); the
+  // adaptive view keys off the count (1 → you×them grid, 2 → A×B grid, 3+ →
+  // composition list). `yourRoles` = opt-in your-role filter used by the
+  // 2-teammate grid ([] = all your roles). `compSort` = composition-list sort.
+  // Per-session only (like pairingMatrixTeammate / expandedTeammates) — resets
+  // on reload, survives sub-tab switches; never persisted to storage.
+  let lineupLab = { people: [], yourRoles: [], compSort: 'games' };
   // Role filter for the Trends > Best per day hero × day heatmap. 'all' shows top heroes
   // across all roles; specific role narrows to that role's heroes only.
   let bestPerDayRoleFilter = 'all';
@@ -9566,6 +9571,386 @@
     return html;
   }
 
+  // === WP-003 Lineup Lab ================================================
+  // Retroactive multi-person comp inspector rendered at the top of the Synergy
+  // tab. Reads the module-level `lineupLab` selection + a match pool, returns
+  // HTML. Increment 1: builder + headline + decomposition ladder. (Sortable
+  // heat-table + auto-insights are later increments.)
+
+  // Renders the Lineup explorer block. `matches` is the same filteredMatches() pool
+  // the rest of the Synergy tab uses (respects season/role/map filters, leavers
+  // included) so its numbers reconcile with the per-teammate cards. `byName` is
+  // the teammate→{allMatches,byRole} map; `peopleSorted` the games-desc people
+  // list (for the add menu); `baseline` the pool-wide WR.
+  function renderLineupLab(matches, byName, peopleSorted, baseline) {
+    var ROLES = ['tank', 'damage', 'support'];
+    var ROLE_LABEL = { tank: 'Tank', damage: 'Damage', support: 'Support' };
+    var ROLE_VAR = { tank: 'var(--wp-tank)', damage: 'var(--wp-damage)', support: 'var(--wp-support)' };
+    // Active-tint backgrounds mirror the .cb-role-btn.active rule. We style the
+    // chips inline rather than reusing .cb-role-btn[data-cbrole] because a broad
+    // handler binds compBuilderChangeRole() to every #stats-content [data-cbrole]
+    // — sharing that attribute here would fire the Dream Comp role setter.
+    var ROLE_TINT = { tank: 'rgba(59, 130, 246, 0.22)', damage: 'rgba(220, 38, 38, 0.22)', support: 'rgba(234, 179, 8, 0.22)' };
+    var MAX_PEOPLE = 4;
+
+    // Compact role pill — the "your role" selector in the 2-teammate grid.
+    // Styled inline (not .cb-role-btn[data-cbrole]) — that attr is bound to
+    // compBuilderChangeRole() across #stats-content and would fire Dream Comp.
+    function rolePill(role, count, active, attrs) {
+      var style = 'flex: 0 0 auto; padding: 3px 9px; font-size: 11px; cursor: pointer;' +
+        ' border: 1px solid var(--wp-border); border-left: 3px solid ' + ROLE_VAR[role] + ';' +
+        ' border-radius: var(--wp-r-sm);' +
+        ' background: ' + (active ? ROLE_TINT[role] : 'var(--wp-surface-1)') + ';' +
+        ' color: ' + (active ? ROLE_VAR[role] : 'var(--wp-fg-2)') + ';' +
+        (active ? ' border-color: ' + ROLE_VAR[role] + '; font-weight: 600;' : '');
+      return '<button ' + attrs + ' style="' + style + '">' + ROLE_LABEL[role] + ' ' + count + 'G</button>';
+    }
+
+    // Shared 3×3 heatmap. rowName/colName label the axes; cell(rowRole,colRole)
+    // returns the matches for that pairing, or null when the pairing is illegal
+    // (→ crossed-out cell). Cells delta against `overall` when it has ≥5 games.
+    function heatGrid(rowName, colName, cell, overall) {
+      var h = '<div style="display: grid; grid-template-columns: 96px repeat(3, 1fr); gap: 4px; margin: 8px 0;">';
+      h += '<div></div>';
+      ROLES.forEach(function(cr) {
+        h += '<div style="padding: 6px 4px; text-align: center; color: var(--wp-fg-3); font-size: 10px; font-weight: 500;">' + escapeHtml(colName) + '<br>' + ROLE_LABEL[cr] + '</div>';
+      });
+      ROLES.forEach(function(rr) {
+        h += '<div style="padding: 6px 4px; color: var(--wp-fg-3); font-size: 10px; font-weight: 500; display: flex; align-items: center;">' + escapeHtml(rowName) + ' ' + ROLE_LABEL[rr] + '</div>';
+        ROLES.forEach(function(cr) {
+          var ms = cell(rr, cr);
+          if (ms === null) { h += '<div class="heatmap-cell empty" title="Illegal — exceeds 5v5 role caps" style="opacity: 0.5;">✕</div>'; return; }
+          if (ms.length < 2) { h += '<div class="heatmap-cell empty">' + (ms.length === 0 ? '—' : '1G') + '</div>'; return; }
+          var w = computeWR(ms);
+          var dHTML = '';
+          if (overall && overall.plays >= 5) { var d = w.wr - overall.wr; dHTML = '<span class="delta">' + (d > 0 ? '+' : '') + d + '</span>'; }
+          h += '<div class="heatmap-cell ' + wrTier(w.wr) + '" title="' + escapeHtml(rowName) + ' ' + ROLE_LABEL[rr] + ' · ' + escapeHtml(colName) + ' ' + ROLE_LABEL[cr] + ': ' + w.plays + 'G | ' + w.wins + 'W–' + w.losses + 'L">' +
+            w.wr + '%<span class="g">' + w.plays + 'G</span>' + dHTML + '</div>';
+        });
+      });
+      return h + '</div>';
+    }
+
+    // 1 teammate → your-role × their-role (the classic pairing matrix).
+    function youThemGrid(name) {
+      var data = byName[name];
+      var overall = computeWR(data.allMatches);
+      var o = '<div class="caption" style="margin-top: 6px;">Role pairings with <strong>' + escapeHtml(name) + '</strong>. Rows: your role · columns: theirs.</div>';
+      o += heatGrid('You', name, function(yourR, theirR) {
+        return data.allMatches.filter(function(m) { return m.myRole === yourR && m.teammates[name] === theirR; });
+      }, overall);
+      if (overall.plays >= 5) {
+        o += '<div class="caption">Overall with ' + escapeHtml(name) + ': ' + overall.plays + 'G | ' + overall.wins + 'W–' + overall.losses + 'L · <span style="color: ' + wrColor(overall.wr) + '; font-weight: 500;">' + overall.wr + '%</span>. Cell deltas vs this.</div>';
+      }
+      return o;
+    }
+
+    // 2 teammates → teammate A × teammate B, your role(s) chosen via pills on top.
+    function pairGrid(a, b) {
+      var myCounts = {}; matches.forEach(function(m) { if (m.myRole) myCounts[m.myRole] = (myCounts[m.myRole] || 0) + 1; });
+      var sel = lineupLab.yourRoles || [];
+      var yroles = sel.length ? sel : ROLES.filter(function(r) { return myCounts[r]; });
+      var o = '<div class="caption" style="margin-top: 6px;">Role pairings between <strong>' + escapeHtml(a) + '</strong> and <strong>' + escapeHtml(b) + '</strong>. Pick your role(s); pairings that break 5v5 role caps are crossed out.</div>';
+      o += '<div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 6px 0;"><span style="font-size: 11px; color: var(--wp-fg-3);">Your role:</span>';
+      ROLES.forEach(function(r) { if (myCounts[r]) o += rolePill(r, myCounts[r], sel.indexOf(r) !== -1, 'data-ll-yourrole="' + r + '"'); });
+      if (sel.length === 0) o += '<span style="font-size: 11px; color: var(--wp-fg-3);">all roles</span>';
+      o += '</div>';
+      function legal(ar, br) {
+        return yroles.some(function(R) { var lim = getRoleLimits(R), c = { tank: 0, damage: 0, support: 0 }; c[ar]++; c[br]++; return c.tank <= lim.tank && c.damage <= lim.damage && c.support <= lim.support; });
+      }
+      var overall = computeWR(matches.filter(function(m) { return m.teammates && m.teammates[a] && m.teammates[b] && yroles.indexOf(m.myRole) !== -1; }));
+      o += heatGrid(a, b, function(ar, br) {
+        if (!legal(ar, br)) return null;
+        return matches.filter(function(m) { return m.teammates && m.teammates[a] === ar && m.teammates[b] === br && yroles.indexOf(m.myRole) !== -1; });
+      }, overall);
+      if (overall.plays >= 5) {
+        o += '<div class="caption">' + escapeHtml(a) + ' + ' + escapeHtml(b) + ' together' + (sel.length ? ' (you on ' + sel.map(function(r) { return ROLE_LABEL[r]; }).join('/') + ')' : '') + ': ' + overall.plays + 'G · <span style="color: ' + wrColor(overall.wr) + '; font-weight: 500;">' + overall.wr + '%</span>. Cell deltas vs this.</div>';
+      }
+      return o;
+    }
+
+    // Your-role fit — for a selected GROUP (all present), your WR by your role,
+    // ranked. Only shown when ≥2 of your roles have a real (≥5G) sample, so
+    // there's an actual comparison to make.
+    function youRoleFit(names) {
+      var present = matches.filter(function(m) {
+        if (!m.teammates) return false;
+        for (var i = 0; i < names.length; i++) { if (!m.teammates[names[i]]) return false; }
+        return true;
+      });
+      var rows = [];
+      ROLES.forEach(function(r) { var ms = present.filter(function(m) { return m.myRole === r; }); if (ms.length) rows.push({ role: r, wr: computeWR(ms) }); });
+      var solid = rows.filter(function(x) { return x.wr.plays >= 5; });
+      if (solid.length < 2) return '';
+      rows.sort(function(a, b) { return b.wr.wr - a.wr.wr; });
+      var bestRole = solid.slice().sort(function(a, b) { return b.wr.wr - a.wr.wr; })[0].role;
+      var o = '<div class="eyebrow" style="margin-top: 14px; margin-bottom: 4px;">Your role fit</div>';
+      o += '<div class="caption">Which of your roles wins most alongside ' + names.map(escapeHtml).join(' + ') + '.</div>';
+      rows.forEach(function(x) {
+        var dim = x.wr.plays < 5 ? ' style="opacity: 0.5;"' : '';
+        var tag = x.role === bestRole ? ' <span style="font-size: 11px; color: var(--wp-win); font-weight: 500; margin-left: 6px;">best fit</span>' : '';
+        o += '<div class="bar-row stacked"' + dim + '><div class="name">You ' + ROLE_LABEL[x.role] + tag + '</div><div class="row-body"><div class="track"><div class="fill" style="width: ' + x.wr.wr + '%; background: ' + ROLE_VAR[x.role] + ';"></div></div><div class="stat-r">' + formatBarRowMeta(x.wr, true) + '</div></div></div>';
+      });
+      return o;
+    }
+
+    // Default-seed the most-played teammate (preserves the old pairing-matrix
+    // behavior of opening straight to a grid); drop stale names after filtering.
+    var withGames = peopleSorted.filter(function(p) { return byName[p.name] && byName[p.name].allMatches.length >= 2; });
+    lineupLab.people = lineupLab.people.filter(function(nm) { return byName[nm]; });
+    if (lineupLab.people.length === 0 && withGames.length > 0) lineupLab.people = [withGames[0].name];
+
+    var out = '';
+    out += '<div class="eyebrow" style="margin-top: 16px; margin-bottom: 6px;">Lineup explorer</div>';
+    out += '<div class="caption">Pick teammates to see how you line up together — role pairings for one or two of them, or every legal 5v5 composition for three-plus.</div>';
+
+    // ---- Builder ----
+    out += '<div style="display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin: 8px 0;">';
+    out += '<span style="font-weight: 600; color: var(--wp-fg-2);">You +</span>';
+    lineupLab.people.forEach(function(nm) {
+      out += '<span style="display: inline-flex; align-items: center; gap: 4px; padding: 4px 4px 4px 10px; background: var(--wp-surface-2); border: 1px solid var(--wp-border); border-radius: var(--wp-r-md); font-weight: 600;">' +
+        escapeHtml(nm) + '<button data-ll-remove="' + escapeHtml(nm) + '" title="Remove" style="background: none; border: none; color: var(--wp-fg-3); cursor: pointer; font-size: 15px; line-height: 1; padding: 0 2px;">&times;</button></span>';
+    });
+    var added = {}; lineupLab.people.forEach(function(nm) { added[nm] = true; });
+    var remaining = peopleSorted.filter(function(p) { return !added[p.name]; });
+    if (lineupLab.people.length >= MAX_PEOPLE) {
+      out += '<span class="caption">max ' + MAX_PEOPLE + ' — remove one to swap</span>';
+    } else if (remaining.length > 0) {
+      out += '<select class="filter-select" id="lineup-add-select"><option value="">+ Add teammate…</option>' +
+        remaining.map(function(p) { return '<option value="' + escapeHtml(p.name) + '">' + escapeHtml(p.name) + ' (' + p.plays + 'G)</option>'; }).join('') + '</select>';
+    }
+    out += '</div>';
+
+    if (lineupLab.people.length === 0) {
+      out += '<div class="caption" style="font-style: italic;">Add a teammate to explore.</div>';
+      return out;
+    }
+
+    // ---- Adaptive body: grid for 1–2 teammates, composition list for 3+ ----
+    var n = lineupLab.people.length;
+    if (n === 1) out += youThemGrid(lineupLab.people[0]);
+    else if (n === 2) out += pairGrid(lineupLab.people[0], lineupLab.people[1]);
+    else out += renderLineupCompositions(matches, byName);
+
+    // Your-role fit — which of your roles wins most alongside this group (2+).
+    if (n >= 2) out += youRoleFit(lineupLab.people);
+
+    return out;
+  }
+
+  // Enumerates concrete role assignments ("compositions") for the selected
+  // lineup: one chosen role per participant (you + each teammate) drawn from
+  // their opted-in roles (or all roles they've played). Overwatch 5v5 role caps
+  // (getRoleLimits) decide which are *possible* — that's both the guard rail
+  // (e.g. 3 Supports → all illegal when you're Support) and the fan-out of
+  // multi-role selections into their legal concrete comps. Renders a uniform
+  // sortable list of legal+played comps, a count of legal-but-unplayed ones, and
+  // crossed-out illegal examples; when nothing is legal, explains why.
+  function renderLineupCompositions(matches, byName) {
+    var ROLES = ['tank', 'damage', 'support'];
+    var ROLE_LETTER = { tank: 'T', damage: 'D', support: 'S' };
+    var ROLE_VAR = { tank: 'var(--wp-tank)', damage: 'var(--wp-damage)', support: 'var(--wp-support)' };
+    var people = lineupLab.people;
+    if (people.length === 0) return '';
+
+    // Candidate roles per participant (you first) = every role they've played in
+    // the pool. The fan-out shows the full legal space — no per-person role
+    // pre-filter (roles are explicit in each enumerated composition).
+    var myPlayed = {};
+    matches.forEach(function(m) { if (m.myRole) myPlayed[m.myRole] = true; });
+    var participants = [{ name: 'You', you: true, cands: ROLES.filter(function(r) { return myPlayed[r]; }) }];
+    people.forEach(function(name) {
+      var played = ROLES.filter(function(r) { return byName[name] && byName[name].byRole[r] && byName[name].byRole[r].length > 0; });
+      participants.push({ name: name, you: false, cands: played });
+    });
+    if (participants.some(function(pt) { return pt.cands.length === 0; })) return '';
+
+    // Cartesian product of candidate roles → one assignment array per combo,
+    // index-aligned to `participants`.
+    var combos = [[]];
+    participants.forEach(function(pt) {
+      var next = [];
+      combos.forEach(function(prefix) { pt.cands.forEach(function(r) { next.push(prefix.concat([r])); }); });
+      combos = next;
+    });
+    function capacity(yourRole, teammateRoles) {
+      var limits = getRoleLimits(yourRole);
+      var counts = { tank: 0, damage: 0, support: 0 };
+      teammateRoles.forEach(function(r) { counts[r]++; });
+      for (var i = 0; i < ROLES.length; i++) {
+        var r = ROLES[i];
+        if (counts[r] > limits[r]) return { ok: false, role: r, cap: limits[r], have: counts[r], yourRole: yourRole };
+      }
+      return { ok: true };
+    }
+    function comboMatches(assign) {
+      return matches.filter(function(m) {
+        if (m.myRole !== assign[0] || !m.teammates) return false;
+        for (var i = 1; i < participants.length; i++) {
+          if (m.teammates[participants[i].name] !== assign[i]) return false;
+        }
+        return true;
+      });
+    }
+    function soloPlays(name, role, yourRole) {
+      return matches.filter(function(m) { return m.myRole === yourRole && m.teammates && m.teammates[name] === role; });
+    }
+
+    var valid = [], invalid = [];
+    combos.forEach(function(assign) {
+      var cap = capacity(assign[0], assign.slice(1));
+      if (!cap.ok) { invalid.push({ roles: assign, reason: cap }); return; }
+      var ms = comboMatches(assign);
+      var wr = computeWR(ms);
+      // Synergy vs the average of each teammate's solo-with-you WR at their
+      // assigned role (and your assigned role) — null when no member has a solo
+      // sample to compare against.
+      var syn = null;
+      if (wr.plays > 0) {
+        var sum = 0, cnt = 0;
+        for (var i = 1; i < participants.length; i++) {
+          var sp = soloPlays(participants[i].name, assign[i], assign[0]);
+          if (sp.length > 0) { sum += computeWR(sp).wr; cnt++; }
+        }
+        if (cnt > 0) syn = Math.round(wr.wr - sum / cnt);
+      }
+      valid.push({ roles: assign, wr: wr, synergy: syn });
+    });
+
+    // One legal candidate is already summarized by the headline above; only
+    // render this section when there's a real fan-out OR the selection is
+    // illegal (so the guard-rail explanation still surfaces).
+    if (combos.length <= 1 && valid.length >= 1) return '';
+
+    var played = valid.filter(function(v) { return v.wr.plays > 0; });
+    var unplayed = valid.length - played.length;
+
+    var sort = lineupLab.compSort || 'games';
+    played.sort(function(a, b) {
+      if (sort === 'wr') return b.wr.wr - a.wr.wr || b.wr.plays - a.wr.plays;
+      if (sort === 'synergy') return (b.synergy == null ? -999 : b.synergy) - (a.synergy == null ? -999 : a.synergy);
+      return b.wr.plays - a.wr.plays || b.wr.wr - a.wr.wr;
+    });
+
+    function badge(role) {
+      return '<span style="display: inline-block; min-width: 13px; text-align: center; font-size: 10px; font-weight: 700; color: #fff; background: ' + ROLE_VAR[role] + '; border-radius: 3px; padding: 0 3px; margin-left: 3px;">' + ROLE_LETTER[role] + '</span>';
+    }
+    function comboLabel(assign) {
+      return participants.map(function(pt, i) {
+        return '<span style="white-space: nowrap;">' + (pt.you ? 'You' : escapeHtml(pt.name)) + badge(assign[i]) + '</span>';
+      }).join(' <span style="color: var(--wp-fg-3);">·</span> ');
+    }
+
+    var out = '';
+    out += '<div class="eyebrow" style="margin-top: 14px; margin-bottom: 4px;">Possible compositions</div>';
+
+    // Nothing legal at all → explain the binding role cap.
+    if (valid.length === 0) {
+      var r0 = invalid[0].reason;
+      var rLabel = r0.role.charAt(0).toUpperCase() + r0.role.slice(1);
+      out += '<div class="caption" style="color: var(--wp-loss);">⚠ No legal 5v5 comp from this selection — it needs ' + r0.have + ' ' + rLabel + 's but only ' + r0.cap + ' ' + rLabel + ' slot' + (r0.cap === 1 ? '' : 's') + ' fit' + (r0.cap === 1 ? 's' : '') + ' when you\'re on ' + (r0.yourRole.charAt(0).toUpperCase() + r0.yourRole.slice(1)) + '. Loosen a role filter.</div>';
+      return out;
+    }
+
+    out += '<div class="caption">Every legal way these players could line up (5v5 role caps applied). Sorted by ' + sort + '.</div>';
+    out += '<div style="margin: 6px 0;"><select class="filter-select" id="lineup-comp-sort">' +
+      [['games', 'Games'], ['wr', 'Win rate'], ['synergy', 'Synergy']].map(function(o) {
+        return '<option value="' + o[0] + '"' + (sort === o[0] ? ' selected' : '') + '>Sort: ' + o[1] + '</option>';
+      }).join('') + '</select></div>';
+
+    if (played.length === 0) {
+      out += '<div class="caption" style="font-style: italic;">No games logged for any legal composition of this selection yet.</div>';
+    }
+    played.forEach(function(v) {
+      var wr = v.wr;
+      var synHTML = '';
+      if (v.synergy != null) {
+        var sSign = v.synergy > 0 ? '+' : '';
+        var sCol = Math.abs(v.synergy) <= 2 ? 'var(--wp-fg-3)' : (v.synergy > 0 ? 'var(--wp-win)' : 'var(--wp-loss)');
+        synHTML = '<span style="font-size: 11px; font-weight: 500; color: ' + sCol + '; margin-left: 8px;">' + sSign + v.synergy + '% synergy</span>';
+      }
+      out += '<div class="bar-row stacked"' + (wr.plays < 5 ? ' style="opacity: 0.55;"' : '') + '>';
+      out += '<div class="name">' + comboLabel(v.roles) + synHTML + '</div>';
+      out += '<div class="row-body">';
+      out += '<div class="track"><div class="fill" style="width: ' + wr.wr + '%; background: var(--wp-fg-2);"></div></div>';
+      out += '<div class="stat-r">' + formatBarRowMeta(wr, true) + '</div>';
+      out += '</div></div>';
+    });
+
+    if (unplayed > 0) {
+      out += '<div class="caption" style="font-style: italic; margin-top: 4px;">+' + unplayed + ' legal composition' + (unplayed === 1 ? '' : 's') + ' you\'ve never played.</div>';
+    }
+
+    // Illegal candidates — show a few crossed-out, summarize the rest.
+    if (invalid.length > 0) {
+      var showN = Math.min(invalid.length, 3);
+      for (var k = 0; k < showN; k++) {
+        var iv = invalid[k];
+        var ivLabel = participants.map(function(pt, i) { return (pt.you ? 'You' : escapeHtml(pt.name)) + ' ' + ROLE_LETTER[iv.roles[i]]; }).join(' · ');
+        var rL = iv.reason.role.charAt(0).toUpperCase() + iv.reason.role.slice(1);
+        out += '<div class="caption" style="margin-top: 4px; text-decoration: line-through; opacity: 0.55;">✕ ' + ivLabel + '</div>' +
+          '<div class="caption" style="opacity: 0.7; margin-top: -2px;">impossible — ' + iv.reason.have + ' ' + rL + 's, cap ' + iv.reason.cap + '</div>';
+      }
+      if (invalid.length > showN) {
+        out += '<div class="caption" style="font-style: italic; margin-top: 2px;">+' + (invalid.length - showN) + ' more impossible (role caps).</div>';
+      }
+    }
+
+    return out;
+  }
+
+  // WP-003: "Your best & worst lineups" — a role-aware leaderboard of the actual
+  // stacks you run. Unlike the role-blind people-pairs in "Teammate combos", each
+  // entry is a concrete composition (your role + 2–3 named teammates each on a
+  // specific role). Enumerates every 2- and 3-member sub-stack per match, gates at
+  // 6 games, ranks by WR delta vs baseline. Global (not tied to the explorer
+  // selection); leavers excluded to match the combo math.
+  function renderBestWorstLineups(matches, baseline) {
+    var ROLE_LETTER = { tank: 'T', damage: 'D', support: 'S' };
+    var ROLE_VAR = { tank: 'var(--wp-tank)', damage: 'var(--wp-damage)', support: 'var(--wp-support)' };
+    var GATE = 6;
+    var sigs = {};
+    function bump(myRole, members) {
+      var key = myRole + '|' + members.map(function(x) { return x.name + ':' + x.role; }).join('|');
+      if (!sigs[key]) sigs[key] = { myRole: myRole, members: members, ms: [] };
+      return sigs[key];
+    }
+    matches.forEach(function(m) {
+      if (m.leaver || !m.teammates) return;
+      var names = Object.keys(m.teammates).sort();
+      if (names.length < 2) return;
+      for (var i = 0; i < names.length; i++) {
+        for (var j = i + 1; j < names.length; j++) {
+          bump(m.myRole, [{ name: names[i], role: m.teammates[names[i]] }, { name: names[j], role: m.teammates[names[j]] }]).ms.push(m);
+          for (var k = j + 1; k < names.length; k++) {
+            bump(m.myRole, [{ name: names[i], role: m.teammates[names[i]] }, { name: names[j], role: m.teammates[names[j]] }, { name: names[k], role: m.teammates[names[k]] }]).ms.push(m);
+          }
+        }
+      }
+    });
+    var entries = Object.keys(sigs).map(function(k) { return sigs[k]; })
+      .filter(function(s) { return s.ms.length >= GATE; })
+      .map(function(s) { var wr = computeWR(s.ms); return { myRole: s.myRole, members: s.members, wr: wr, delta: wr.wr - baseline.wr }; });
+    if (entries.length === 0) return '';
+    entries.sort(function(a, b) { return b.delta - a.delta; });
+    var strong = entries.slice(0, 3).filter(function(e) { return e.delta > 0; });
+    var weak = entries.filter(function(e) { return e.delta < 0; }).slice(-3).reverse();
+    if (strong.length === 0 && weak.length === 0) return '';
+
+    function badge(role) { return '<span style="display: inline-block; min-width: 13px; text-align: center; font-size: 10px; font-weight: 700; color: #fff; background: ' + ROLE_VAR[role] + '; border-radius: 3px; padding: 0 3px; margin-left: 3px;">' + ROLE_LETTER[role] + '</span>'; }
+    function label(e) { return '<span style="white-space: nowrap;">You' + badge(e.myRole) + '</span> ' + e.members.map(function(x) { return '<span style="white-space: nowrap;">' + escapeHtml(x.name) + badge(x.role) + '</span>'; }).join(' '); }
+    function row(e, kind) {
+      var sign = e.delta > 0 ? '+' : '';
+      var col = kind === 'over' ? 'var(--wp-win)' : 'var(--wp-loss)';
+      return '<div class="discovery-row ' + kind + '"><div><span class="label">' + label(e) + '</span><span class="meta">' + e.wr.plays + 'G ' + e.wr.wins + 'W–' + e.wr.losses + 'L · ' + e.wr.wr + '%</span></div><div class="delta" style="color: ' + col + ';">' + sign + e.delta + 'pp</div></div>';
+    }
+    var o = '<div class="eyebrow" style="margin-top: 16px; margin-bottom: 6px;">Your best &amp; worst lineups</div>';
+    o += '<div class="caption">Actual role-specific stacks you\'ve run (2–3 teammates, ' + GATE + 'G+), vs your ' + baseline.wr + '% baseline.</div>';
+    if (strong.length) { o += '<div style="font-size: 12px; font-weight: 500; color: var(--wp-win); margin: 6px 0 2px;">Strongest</div>'; strong.forEach(function(e) { o += row(e, 'over'); }); }
+    if (weak.length) { o += '<div style="font-size: 12px; font-weight: 500; color: var(--wp-loss); margin: 8px 0 2px;">Weakest</div>'; weak.forEach(function(e) { o += row(e, 'under'); }); }
+    return o;
+  }
+
   function renderStatsSynergy() {
     var matches = filteredMatches();
     var baseline = computeWR(matches);
@@ -9752,91 +10137,16 @@
       html += '</div>';
     });
 
-    // === Pairing matrix ===
-    // v2.0.0-13ad: 3×3 grid using .heatmap-cell tiers. Color tiers parallel
-    // wrColor's --wp-wr-* gradient — best/good/meh/bad with extremes filled
-    // and middles tinted. Empty cells (zero or one play) use .empty styling.
-    var teammatesWithGames = Object.keys(byName).filter(function(n) {
-      return byName[n].allMatches.length >= 2;
-    }).sort(function(a, b) {
-      return byName[b].allMatches.length - byName[a].allMatches.length;
-    });
+    // === Lineup explorer (WP-003) === replaces the old pairing matrix. The
+    // builder drives an adaptive body: 1 teammate → your-role × their-role grid
+    // (the classic pairing matrix); 2 teammates → teammate × teammate grid with
+    // a your-role selector on top; 3+ → legal-composition list (5v5 role caps).
+    // Shares the filteredMatches() pool + baseline computed at the top.
+    html += renderLineupLab(matches, byName, people, baseline);
 
-    if (teammatesWithGames.length > 0) {
-      // Default to most-played if nothing selected, or if previous selection no longer has data
-      if (!pairingMatrixTeammate || teammatesWithGames.indexOf(pairingMatrixTeammate) < 0) {
-        pairingMatrixTeammate = teammatesWithGames[0];
-      }
-
-      html += '<div class="eyebrow" style="margin-top: 16px; margin-bottom: 6px;">Pairing matrix</div>';
-      html += '<div class="caption">How role pairings with a specific teammate break down. Rows: your role. Columns: their role.</div>';
-
-      // Teammate dropdown
-      var tmOpts = teammatesWithGames.map(function(name) {
-        var n = byName[name].allMatches.length;
-        return '<option value="' + escapeHtml(name) + '"' + (name === pairingMatrixTeammate ? ' selected' : '') + '>' + escapeHtml(name) + ' (' + n + 'G)</option>';
-      }).join('');
-      html += '<div style="margin-bottom: 10px;"><select class="filter-select" id="pairing-matrix-select">' + tmOpts + '</select></div>';
-
-      // Build the cross-tabulation: cells[yourRole][theirRole] = matches[]
-      var pmCells = {
-        tank: { tank: [], damage: [], support: [] },
-        damage: { tank: [], damage: [], support: [] },
-        support: { tank: [], damage: [], support: [] }
-      };
-      byName[pairingMatrixTeammate].allMatches.forEach(function(m) {
-        var theirRole = m.teammates[pairingMatrixTeammate];
-        var yourRole = m.myRole;
-        if (!theirRole || !yourRole) return;
-        if (pmCells[yourRole] && pmCells[yourRole][theirRole]) {
-          pmCells[yourRole][theirRole].push(m);
-        }
-      });
-
-      var pmOverall = computeWR(byName[pairingMatrixTeammate].allMatches);
-
-      var pmRoles = ['tank', 'damage', 'support'];
-      var pmLabels = { tank: 'Tank', damage: 'Damage', support: 'Support' };
-
-      // 4-column grid: corner + 3 their-role headers
-      html += '<div style="display: grid; grid-template-columns: 90px repeat(3, 1fr); gap: 4px; margin-bottom: 8px;">';
-      // Header corner cell
-      html += '<div></div>';
-      pmRoles.forEach(function(theirR) {
-        html += '<div style="padding: 6px 4px; text-align: center; color: var(--wp-fg-3); font-size: 10px; font-weight: 500;">' + escapeHtml(pairingMatrixTeammate) + '<br>' + pmLabels[theirR] + '</div>';
-      });
-      // Data rows
-      pmRoles.forEach(function(yourR) {
-        html += '<div style="padding: 6px 4px; color: var(--wp-fg-3); font-size: 10px; font-weight: 500; display: flex; align-items: center;">You ' + pmLabels[yourR] + '</div>';
-        pmRoles.forEach(function(theirR) {
-          var cellMatches = pmCells[yourR][theirR];
-          if (cellMatches.length < 2) {
-            html += '<div class="heatmap-cell empty">' +
-              (cellMatches.length === 0 ? '—' : '1G') +
-              '</div>';
-            return;
-          }
-          var cellWR = computeWR(cellMatches);
-          var tier = wrTier(cellWR.wr);
-          // Delta vs the user's overall WR with this teammate
-          var pmDelta = pmOverall.plays >= 5 ? cellWR.wr - pmOverall.wr : null;
-          var deltaHTML = '';
-          if (pmDelta !== null) {
-            var dSign = pmDelta > 0 ? '+' : '';
-            deltaHTML = '<span class="delta">' + dSign + pmDelta + '</span>';
-          }
-          html += '<div class="heatmap-cell ' + tier + '" title="You ' + pmLabels[yourR] + ' · ' + escapeHtml(pairingMatrixTeammate) + ' ' + pmLabels[theirR] + ': ' + cellWR.plays + 'G | ' + cellWR.wins + 'W–' + cellWR.losses + 'L">' +
-            cellWR.wr + '%' +
-            '<span class="g">' + cellMatches.length + 'G</span>' +
-            deltaHTML +
-            '</div>';
-        });
-      });
-      html += '</div>';
-      if (pmOverall.plays >= 5) {
-        html += '<div class="caption">Overall with ' + escapeHtml(pairingMatrixTeammate) + ': ' + pmOverall.plays + 'G | ' + pmOverall.wins + 'W–' + pmOverall.losses + 'L · <span style="color: ' + wrColor(pmOverall.wr) + '; font-weight: 500;">' + pmOverall.wr + '%</span>. Cell deltas show change vs this baseline.</div>';
-      }
-    }
+    // === Your best & worst lineups (WP-003) === role-aware leaderboard of the
+    // actual stacks you run, independent of the explorer selection above.
+    html += renderBestWorstLineups(matches, baseline);
 
     // === Time patterns ===
     // v2.0.0-13bb: flat leaderboard layout. Was per-teammate cards with up to
@@ -12246,18 +12556,13 @@
       });
     });
     // Pairing matrix teammate selector (Synergy tab)
-    var pmSelect = document.getElementById('pairing-matrix-select');
-    if (pmSelect) pmSelect.addEventListener('change', function(e) {
-      pairingMatrixTeammate = e.target.value;
-      renderStats();
-    });
     // v2.0.0-13ae: expandable Synergy teammate cards. Click toggles membership
     // in expandedTeammates and re-renders Stats. Use closest() to resolve the
     // card from any inner element click target (chevron, name, sub-line, bar).
     document.querySelectorAll('#stats-content [data-expand-teammate]').forEach(function(card) {
       card.addEventListener('click', function(e) {
-        // Don't toggle if the click is inside the pairing-matrix-select dropdown
-        // or any other interactive element added in the future.
+        // Don't toggle if the click is inside an interactive element (dropdowns,
+        // buttons, etc.).
         if (e.target.closest('select, button, input, a')) return;
         var name = card.dataset.expandTeammate;
         if (expandedTeammates.has(name)) {
@@ -12286,6 +12591,38 @@
         saveState();
         renderStats();
       });
+    });
+
+    // WP-003: Lineup explorer controls (Synergy tab). All mutate the transient
+    // lineupLab selection and re-render. No saveState() — selection is per-session.
+    var llAdd = document.getElementById('lineup-add-select');
+    if (llAdd) llAdd.addEventListener('change', function(e) {
+      var name = e.target.value;
+      if (name && lineupLab.people.length < 4 && lineupLab.people.indexOf(name) === -1) {
+        lineupLab.people.push(name);
+      }
+      renderStats();
+    });
+    document.querySelectorAll('#stats-content [data-ll-remove]').forEach(function(btn) {
+      btn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        var name = btn.getAttribute('data-ll-remove');
+        lineupLab.people = lineupLab.people.filter(function(nm) { return nm !== name; });
+        renderStats();
+      });
+    });
+    document.querySelectorAll('#stats-content [data-ll-yourrole]').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var r = btn.getAttribute('data-ll-yourrole');
+        var i = lineupLab.yourRoles.indexOf(r);
+        if (i === -1) lineupLab.yourRoles.push(r); else lineupLab.yourRoles.splice(i, 1);
+        renderStats();
+      });
+    });
+    var llSort = document.getElementById('lineup-comp-sort');
+    if (llSort) llSort.addEventListener('change', function(e) {
+      lineupLab.compSort = e.target.value;
+      renderStats();
     });
 
     // v2.4.0: Synergy spotlight Chart.js instantiation. Walks every visible

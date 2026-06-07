@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Watchpoint — Game Tracker (v2.5.0)</title>
+<title>Watchpoint — Game Tracker (v2.5.1)</title>
 <!-- v2.0.0-11: Inter + JetBrains Mono per the design system. preconnect speeds up the
      handshake; the actual stylesheet is loaded async with display=swap so first paint
      never blocks on Google's response. If Google Fonts is blocked or slow, the
@@ -2870,7 +2870,7 @@
       <span class="wp-account-pill" id="wp-account-pill" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false" aria-label="Switch account"></span>
       <div class="wp-account-menu" id="wp-account-menu" role="listbox"></div>
     </span>
-    <span class="wp-version">v2.5.0</span>
+    <span class="wp-version">v2.5.1</span>
   </div>
   <h2 class="sr-only">Watchpoint — Overwatch match tracker and analytics</h2>
 
@@ -3720,7 +3720,7 @@
   // 2-teammate grid ([] = all your roles). `compSort` = composition-list sort.
   // Per-session only (like pairingMatrixTeammate / expandedTeammates) — resets
   // on reload, survives sub-tab switches; never persisted to storage.
-  let lineupLab = { people: [], yourRoles: [], compSort: 'games' };
+  let lineupLab = { people: [], yourRoles: [], compSort: 'games', seeded: false };
   // Role filter for the Trends > Best per day hero × day heatmap. 'all' shows top heroes
   // across all roles; specific role narrows to that role's heroes only.
   let bestPerDayRoleFilter = 'all';
@@ -9694,11 +9694,16 @@
       return o;
     }
 
-    // Default-seed the most-played teammate (preserves the old pairing-matrix
-    // behavior of opening straight to a grid); drop stale names after filtering.
+    // Default-seed the most-played teammate ONCE per session (preserves the old
+    // pairing-matrix behavior of opening straight to a grid) — but only on the
+    // first Synergy render, so the user can clear the selection to empty and it
+    // stays that way (WP-007). Stale-name filtering still runs every render.
     var withGames = peopleSorted.filter(function(p) { return byName[p.name] && byName[p.name].allMatches.length >= 2; });
     lineupLab.people = lineupLab.people.filter(function(nm) { return byName[nm]; });
-    if (lineupLab.people.length === 0 && withGames.length > 0) lineupLab.people = [withGames[0].name];
+    if (!lineupLab.seeded && lineupLab.people.length === 0 && withGames.length > 0) {
+      lineupLab.people = [withGames[0].name];
+    }
+    lineupLab.seeded = true;
 
     var out = '';
     out += '<div class="eyebrow" style="margin-top: 16px; margin-bottom: 6px;">Lineup explorer</div>';

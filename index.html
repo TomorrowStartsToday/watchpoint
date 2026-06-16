@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Watchpoint — Game Tracker (v2.6.0)</title>
+<title>Watchpoint — Game Tracker (v2.6.1)</title>
 <!-- v2.0.0-11: Inter + JetBrains Mono per the design system. preconnect speeds up the
      handshake; the actual stylesheet is loaded async with display=swap so first paint
      never blocks on Google's response. If Google Fonts is blocked or slow, the
@@ -2870,7 +2870,7 @@
       <span class="wp-account-pill" id="wp-account-pill" role="button" tabindex="0" aria-haspopup="listbox" aria-expanded="false" aria-label="Switch account"></span>
       <div class="wp-account-menu" id="wp-account-menu" role="listbox"></div>
     </span>
-    <span class="wp-version">v2.6.0</span>
+    <span class="wp-version">v2.6.1</span>
   </div>
   <h2 class="sr-only">Watchpoint — Overwatch match tracker and analytics</h2>
 
@@ -3244,7 +3244,7 @@
 
   const DEFAULT_HEROES = {
     tank: ['D.Va','Domina','Doomfist','Hazard','Junker Queen','Mauga','Orisa','Ramattra','Reinhardt','Roadhog','Sigma','Winston','Wrecking Ball','Zarya'],
-    damage: ['Anran','Ashe','Bastion','Cassidy','Echo','Emre','Freja','Genji','Hanzo','Junkrat','Mei','Pharah','Reaper', 'Shion', 'Sierra','Sojourn','Soldier: 76','Sombra','Symmetra','Torbjörn','Tracer','Vendetta','Venture','Widowmaker'],
+    damage: ['Anran','Ashe','Bastion','Cassidy','Echo','Emre','Freja','Genji','Hanzo','Junkrat','Mei','Pharah','Reaper','Shion','Sierra','Sojourn','Soldier: 76','Sombra','Symmetra','Torbjörn','Tracer','Vendetta','Venture','Widowmaker'],
     support: ['Ana','Baptiste','Brigitte','Illari','Jetpack Cat','Juno','Kiriko','Lifeweaver','Lúcio','Mercy','Mizuki','Moira','Wuyang','Zenyatta']
   };
   // HEROES is mutable and will be loaded/merged from state.customAdded / state.customRemoved
@@ -3257,7 +3257,7 @@
   const MAPS = {
     control: ['Antarctic Peninsula', 'Busan', 'Ilios', 'Lijiang Tower', 'Nepal', 'Oasis', 'Samoa'],
     escort: ['Circuit Royal', 'Dorado', 'Havana', 'Junkertown', 'Rialto', 'Route 66', 'Shambali Monastery', 'Watchpoint: Gibraltar'],
-    hybrid: ['Blizzard World', 'Eichenwalde', 'Hollywood', "King's Row", 'Midtown', 'Numbani', 'Paraíso', 'Neon Junction'],
+    hybrid: ['Blizzard World', 'Eichenwalde', 'Hollywood', "King's Row", 'Midtown', 'Neon Junction', 'Numbani', 'Paraíso'],
     push: ['Colosseo', 'Esperança', 'New Queen Street', 'Runasapi'],
     flashpoint: ['Aatlis', 'New Junk City', 'Suravasa'],
     clash: ['Hanaoka', 'Throne of Anubis']
@@ -3887,7 +3887,7 @@
     var s3Start = new Date(2026, 5, 16, 11, 0, 0).getTime(); // Jun 16 2026 11am local (placeholder)
     state.seasons.push({ id: 1, name: 'Season 1: Conquest', startTs: s1Start, endTs: s2Start });
     state.seasons.push({ id: 2, name: 'Season 2: Summit',   startTs: s2Start, endTs: s3Start });
-    state.seasons.push({ id: 3, name: 'Season 3: Into the Tiger\'s Den',           startTs: s3Start, endTs: null });
+    state.seasons.push({ id: 3, name: 'Season 3: Into the Tiger\'s Den', startTs: s3Start, endTs: null });
     state.currentSeasonId = 2;
     state.matchLog.forEach(function(m) {
       if (m.seasonId !== null && m.seasonId !== undefined) return;
